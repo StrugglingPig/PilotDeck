@@ -2,7 +2,7 @@ import type { ModelCapabilities } from "./capabilities.js";
 import type { CanonicalModelError } from "./errors.js";
 import type { MultimodalConstraints } from "./multimodal.js";
 
-export type ModelProtocol = "anthropic" | "openai";
+export type ModelProtocol = "anthropic" | "openai" | "openai-responses" | "google";
 
 export type CanonicalRole = "user" | "assistant";
 
@@ -20,6 +20,8 @@ export type CanonicalThinkingBlock = {
    * when the message is replayed; preserved verbatim.
    */
   signature?: string;
+  /** Provider-native reasoning_content that should be replayed when present. */
+  reasoningContent?: string;
 };
 
 export type CanonicalImageBlock = {
@@ -45,6 +47,7 @@ export type CanonicalAudioBlock = {
   source: "base64" | "url";
   data: string;
   mimeType: string;
+  bytes?: number;
   durationSeconds?: number;
 };
 
@@ -81,8 +84,12 @@ export type CanonicalToolResultContentBlock =
 export type CanonicalToolResultReferenceBlock = {
   type: "tool_result_reference";
   toolCallId: string;
+  /** Mirrors CanonicalToolResultBlock.isError when a large error result is persisted. */
+  isError?: boolean;
   /** Absolute path to the persisted file. */
   path: string;
+  /** Workspace-relative path that can be read with read_file when available. */
+  readFilePath?: string;
   /** Original size in bytes / characters of the full result. */
   originalBytes: number;
   /** Truncated preview (UTF-8 text) sent inline alongside the reference. */
@@ -92,6 +99,24 @@ export type CanonicalToolResultReferenceBlock = {
   /** Optional MIME hint (`application/json`, `text/plain`, ...). */
   mimeType?: string;
   /** Optional friendly description of why the body was persisted. */
+  reason?: string;
+};
+
+export type CanonicalMediaReferenceBlock = {
+  type: "media_reference";
+  /** Originating tool call when known. Older transcripts may omit this. */
+  toolCallId?: string;
+  /** Absolute path to the persisted media body. */
+  path: string;
+  /** Original binary size when known, otherwise persisted payload bytes. */
+  originalBytes: number;
+  /** Human-readable placeholder shown to the model/UI. */
+  preview: string;
+  hasMore: boolean;
+  mimeType: string;
+  mediaType: "image" | "pdf" | "audio";
+  pages?: number;
+  detail?: "auto" | "low" | "high";
   reason?: string;
 };
 
@@ -105,12 +130,27 @@ export type CanonicalContentBlock =
   | CanonicalAudioBlock
   | CanonicalToolCallBlock
   | CanonicalToolResultBlock
-  | CanonicalToolResultReferenceBlock;
+  | CanonicalToolResultReferenceBlock
+  | CanonicalMediaReferenceBlock;
 
 export type CanonicalMessageMetadata = {
   /** True for messages injected by the system (e.g. JSON self-correct prompts). */
   synthetic?: boolean;
+  /** Synthetic prompt that should be consumed by the next assistant response only. */
+  transient?: boolean;
+  /** Stable id used by the agent loop to expire transient synthetic prompts. */
+  transientId?: string;
+  /** Originating tool call for projected supplemental result messages. */
+  toolCallId?: string;
+  /** Message replaces compacted history and is omitted from the visible transcript. */
+  compactReplacement?: boolean;
+  /** Compaction id of the effective replacement snapshot persisted in the transcript. */
+  compactSnapshotId?: string;
   purpose?: string;
+  forkCarryover?: {
+    sourceSessionId: string;
+    sourceTurnId?: string;
+  };
 };
 
 export type CanonicalMessage = {
@@ -135,8 +175,11 @@ export type CanonicalToolChoice =
     };
 
 export type CanonicalThinkingConfig = {
+  mode?: "default" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   enabled: boolean;
   budgetTokens?: number;
+  preserve?: boolean;
+  splitReasoning?: boolean;
 };
 
 /**
@@ -208,13 +251,21 @@ export type CanonicalFinishReason =
   | "unknown";
 
 export type CanonicalModelEvent =
-  | { type: "request_started"; provider: string; model: string; metadata?: Record<string, unknown> }
+  | {
+      type: "request_started";
+      provider: string;
+      model: string;
+      providerBaseUrl?: string;
+      /** Opaque digest of the exact request dispatched to the provider. */
+      requestFingerprint?: string;
+      metadata?: Record<string, unknown>;
+    }
   | { type: "message_start"; role: "assistant"; raw?: unknown }
   | { type: "text_delta"; text: string; raw?: unknown }
-  | { type: "thinking_delta"; text: string; signature?: string; raw?: unknown }
+  | { type: "thinking_delta"; text: string; signature?: string; reasoningContent?: string; raw?: unknown }
   | { type: "tool_call_start"; id: string; name: string; raw?: unknown }
   | { type: "tool_call_delta"; id: string; delta: string; raw?: unknown }
-  | { type: "tool_call_end"; toolCall: CanonicalToolCall; raw?: unknown }
+  | { type: "tool_call_end"; toolCall: CanonicalToolCall; wasRepaired?: boolean; raw?: unknown }
   | { type: "message_end"; finishReason: CanonicalFinishReason; raw?: unknown }
   | { type: "usage"; usage: CanonicalUsage; raw?: unknown }
   | { type: "error"; error: CanonicalModelError };
@@ -235,6 +286,25 @@ export type ModelDefinition = {
   aliases?: string[];
 };
 
+export type ProviderRetryConfig = {
+  /** Max retries for non-streaming HTTP requests. Default 2. */
+  requestMaxRetries?: number;
+  /** Max retries for dropped SSE streams. Default 2. */
+  streamMaxRetries?: number;
+  /** First-token / idle timeout (ms) for streaming responses. Defaults to 600000ms when omitted. */
+  streamIdleTimeoutMs?: number;
+  /** Maximum streaming duration (ms). Default disabled. */
+  maxStreamingDurationMs?: number;
+  /** Repeated non-empty text chunk limit before treating a stream as looping. Default 100. */
+  repeatedChunkLimit?: number;
+  /** Base delay (ms) for retry backoff. Default 500. */
+  baseDelayMs?: number;
+  /** Max delay cap (ms) for backoff. Default 8000. */
+  maxDelayMs?: number;
+  /** Jitter multiplier for retry backoff. Default 0.75. */
+  jitter?: number;
+};
+
 export type ProviderConfig = {
   id: string;
   protocol: ModelProtocol;
@@ -244,7 +314,7 @@ export type ProviderConfig = {
   headers: Record<string, string>;
   /** Arbitrary fields merged into every request body (e.g. OpenRouter provider preferences). */
   extraBody?: Record<string, unknown>;
-  retry?: Record<string, unknown>;
+  retry?: ProviderRetryConfig;
   models: Record<string, ModelDefinition>;
 };
 

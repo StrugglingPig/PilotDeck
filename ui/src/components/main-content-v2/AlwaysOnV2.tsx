@@ -17,18 +17,27 @@ type PlanDetailTarget = {
 
 const SUB_TABS: { id: AlwaysOnSubTab; labelKey: string; defaultLabel: string; icon: typeof BarChart3 }[] = [
   { id: 'dashboard', labelKey: 'tabs.dashboard', defaultLabel: 'Dashboard', icon: BarChart3 },
-  { id: 'plans-cron', labelKey: 'tabs.plansCron', defaultLabel: 'Plans & Cron Jobs', icon: ListChecks },
+  { id: 'plans', labelKey: 'tabs.plans', defaultLabel: 'Plans', icon: ListChecks },
 ];
 
 type AlwaysOnV2Props = {
   selectedProject: Project | null;
+  subTab: AlwaysOnSubTab;
+  onSubTabChange: (tab: AlwaysOnSubTab) => void;
   onApplyWorkCycle?: (projectName: string, cycleId: string) => Promise<void>;
   onOpenExecutionSession?: (projectKey: string, runId: string, projectName?: string) => void;
+  compact?: boolean;
 };
 
-export default function AlwaysOnV2({ selectedProject, onApplyWorkCycle, onOpenExecutionSession }: AlwaysOnV2Props) {
+export default function AlwaysOnV2({
+  selectedProject,
+  subTab,
+  onSubTabChange,
+  onApplyWorkCycle,
+  onOpenExecutionSession,
+  compact = false,
+}: AlwaysOnV2Props) {
   const { t } = useTranslation('alwaysOn');
-  const [subTab, setSubTab] = useState<AlwaysOnSubTab>('dashboard');
   const [planDetail, setPlanDetail] = useState<PlanDetailTarget | null>(null);
 
   const handleOpenPlanDetail = useCallback(
@@ -49,7 +58,10 @@ export default function AlwaysOnV2({ selectedProject, onApplyWorkCycle, onOpenEx
   return (
     <div className="flex h-full flex-col bg-white dark:bg-neutral-950">
       {/* Sub-tab bar */}
-      <div className="flex shrink-0 gap-1 border-b border-neutral-200 px-8 pt-4 dark:border-neutral-800">
+      <div className={cn(
+        'flex shrink-0 gap-1 overflow-x-auto border-b border-neutral-200 pt-3 dark:border-neutral-800',
+        compact ? 'px-3' : 'px-8',
+      )}>
         {SUB_TABS.map((tab) => {
           const Icon = tab.icon;
           const isActive = subTab === tab.id;
@@ -57,7 +69,7 @@ export default function AlwaysOnV2({ selectedProject, onApplyWorkCycle, onOpenEx
             <button
               key={tab.id}
               type="button"
-              onClick={() => setSubTab(tab.id)}
+              onClick={() => onSubTabChange(tab.id)}
               className={cn(
                 'inline-flex items-center gap-1.5 border-b-2 px-3 pb-2 text-[13px] font-medium transition-colors',
                 isActive
@@ -81,14 +93,15 @@ export default function AlwaysOnV2({ selectedProject, onApplyWorkCycle, onOpenEx
             projectDisplayName={planDetail.projectDisplayName}
             runId={planDetail.sourceRunId}
             projectKey={planDetail.projectKey}
-            backLabel={t('dashboard.runDetail.backToPlans', { defaultValue: 'Back to Plans & Cron Jobs' })}
+            backLabel={t('dashboard.runDetail.backToPlans', { defaultValue: 'Back to Plans' })}
             onBack={() => setPlanDetail(null)}
             onOpenExecutionSession={onOpenExecutionSession}
+            compact={compact}
           />
         ) : subTab === 'dashboard' ? (
-          <AlwaysOnDashboard onOpenExecutionSession={onOpenExecutionSession} />
+          <AlwaysOnDashboard onOpenExecutionSession={onOpenExecutionSession} compact={compact} />
         ) : (
-          <PlansAndCronJobs onApplyWorkCycle={onApplyWorkCycle} onOpenPlanDetail={handleOpenPlanDetail} />
+          <PlansAndCronJobs onApplyWorkCycle={onApplyWorkCycle} onOpenPlanDetail={handleOpenPlanDetail} compact={compact} />
         )}
       </div>
     </div>

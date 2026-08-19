@@ -21,6 +21,7 @@ import type {
   CanonicalMessage,
   CanonicalUsage,
 } from "../../model/index.js";
+import { messageContent } from "../../model/protocol/clone.js";
 import type { AgentRuntimeConfig } from "../runtime/AgentRuntimeConfig.js";
 import type { AgentRuntimeDependencies } from "../runtime/AgentRuntimeDependencies.js";
 import { ToolRegistry } from "../../tool/registry/ToolRegistry.js";
@@ -44,22 +45,15 @@ import {
   cloneReadFileState,
   cloneWriteSnapshots,
 } from "./contextInheritance.js";
-import { filterIncompleteToolCalls } from "./filterIncompleteToolCalls.js";
+
 
 const SUMMARY_FIELDS = ["Scope", "Result", "Key files", "Files changed", "Issues"] as const;
-const SUBAGENT_DEFAULT_MAX_TURNS = 16;
 
 export type SubAgentSessionOptions = {
   /** The subagent preset (general-purpose / explore / plan). */
   definition: SubagentDefinition;
   /** Free-text directive from the parent (becomes the subagent's user prompt). */
   directive: string;
-  /**
-   * Parent's accumulated message history. We slice off the *last* assistant
-   * message to seed the fork (S1). Caller should pass parent's full history
-   * up to and including the assistant turn that issued the `agent` tool call.
-   */
-  parentMessages: CanonicalMessage[];
   /** Parent agent's runtime config (provider, model, permission mode, ...). */
   parentConfig: AgentRuntimeConfig;
   /** Parent agent's runtime dependencies (model, scheduler factory, ...). */
@@ -75,7 +69,7 @@ export type SubAgentSessionOptions = {
   subagentSessionId: string;
   /** Stable subagent UUID — mirrors C3 sidechain naming. */
   subagentId: string;
-  /** Cap on AgentLoop turns inside the fork. Defaults to 16. */
+  /** Optional cap on AgentLoop turns inside the fork. Unbounded when omitted. */
   maxTurns?: number;
   /** Abort signal forwarded to the child loop. */
   abortSignal?: AbortSignal;
@@ -93,7 +87,12 @@ export type SubAgentSessionOptions = {
  * (the parent constructs the writer and passes it in).
  */
 export type SidechainTranscriptWriter = {
-  recordAcceptedInput(sessionId: string, turnId: string, messages: CanonicalMessage[]): Promise<void>;
+  recordAcceptedInput(
+    sessionId: string,
+    turnId: string,
+    messages: CanonicalMessage[],
+    metadata?: Record<string, unknown>,
+  ): Promise<void>;
   recordDurableMessage(sessionId: string, turnId: string, message: CanonicalMessage): Promise<void>;
 };
 
@@ -140,7 +139,7 @@ export class SubAgentSession {
       sessionId: this.options.subagentSessionId,
       turnId,
       messages,
-      maxTurns: this.options.maxTurns ?? SUBAGENT_DEFAULT_MAX_TURNS,
+      maxTurns: this.options.maxTurns,
       abortSignal: this.options.abortSignal,
     });
     while (true) {
@@ -165,6 +164,11 @@ export class SubAgentSession {
     if (!last) {
       throw new Error("SubAgentSession: AgentLoop returned no result");
     }
+    if (last.result.type === "aborted") {
+      throw new Error(
+        `SubAgentSession: subagent turn aborted (${last.result.stopReason})`,
+      );
+    }
     if (last.result.type === "error") {
       const details = last.result.errors?.map((error) => error.message).join("; ");
       throw new Error(
@@ -185,34 +189,17 @@ export class SubAgentSession {
   }
 
   private buildInitialMessages(): CanonicalMessage[] {
-    const parentLast = this.options.parentMessages[this.options.parentMessages.length - 1];
-    if (!parentLast || parentLast.role !== "assistant") {
-      // Fall back to a synthetic assistant message that just references the
-      // directive (rare; happens for tool-driven invocations where the parent
-      // hasn't produced an assistant message yet).
-      const synthetic: CanonicalMessage = {
-        role: "assistant",
-        content: [
-          {
-            type: "text",
-            text: "(parent did not produce an assistant message before forking)",
-          },
-        ],
-      };
-      return filterIncompleteToolCalls(buildForkedMessages(this.options.directive, synthetic));
-    }
-    return filterIncompleteToolCalls(
-      buildForkedMessages(this.options.directive, parentLast),
-    );
+    return buildForkedMessages(this.options.directive);
   }
 
   private buildScopedRegistry(): ToolRegistry {
     const scoped = new ToolRegistry();
     const allowedSet = new Set(this.options.definition.allowedTools);
     const wildcard = allowedSet.has("*");
-    const forceReadOnly = this.options.definition.isReadOnly
-      || this.options.parentConfig.permissionMode === "plan";
     for (const tool of this.options.parentDependencies.tools.registry.list()) {
+      if (!wildcard && !allowedSet.has(tool.name)) {
+        continue;
+      }
       if (tool.name === "enter_plan_mode" || tool.name === "exit_plan_mode") {
         continue; // Subagents must not participate in the plan-mode workflow.
       }
@@ -225,10 +212,6 @@ export class SubAgentSession {
       if (tool.name === "ask_user_question") {
         continue; // Subagents have no elicitation channel.
       }
-      if (forceReadOnly && tool.isDestructive?.({} as never) === true) {
-        continue; // S9 — read-only subagents reject destructive tools outright
-      }
-      if (!wildcard && !allowedSet.has(tool.name)) continue;
       scoped.register(tool as PilotDeckToolDefinition);
     }
     return scoped;
@@ -285,12 +268,22 @@ export class SubAgentSession {
       uuid: this.options.parentDependencies.uuid,
       auditRecorder: this.options.parentDependencies.auditRecorder,
       lifecycle: this.options.parentDependencies.lifecycle,
+      tokenAccounting: this.options.parentDependencies.tokenAccounting,
+      getModelMaxContextTokens: this.options.parentDependencies.getModelMaxContextTokens,
+      getModelMaxOutputTokens: this.options.parentDependencies.getModelMaxOutputTokens,
+      getModelTokenLimits: this.options.parentDependencies.getModelTokenLimits,
       subagentTranscript: this.options.parentDependencies.subagentTranscript,
     };
   }
 
   private buildConfig(): AgentRuntimeConfig {
     const parent = this.options.parentConfig;
+    const subagentModel = parent.subagentModel;
+    const {
+      maxContextTokens: _parentMaxContextTokens,
+      maxOutputTokens: _parentMaxOutputTokens,
+      ...parentWithoutTokenCaps
+    } = parent;
     const subagentSystem = buildSubagentSystemPrompt(this.options.definition);
     const filteredParentSystem = applySystemPromptFilters(
       parent.systemPrompt ?? "",
@@ -300,7 +293,21 @@ export class SubAgentSession {
       ? `${subagentSystem}\n\n${filteredParentSystem}`
       : subagentSystem;
     return {
-      ...parent,
+      ...(subagentModel ? parentWithoutTokenCaps : parent),
+      ...(subagentModel
+        ? {
+            provider: subagentModel.provider,
+            model: subagentModel.model,
+            ...(subagentModel.modelMultimodal
+              ? { modelMultimodal: subagentModel.modelMultimodal }
+              : {}),
+          }
+        : {}),
+      // Ask mode performs read-only checks against each tool call's real
+      // input. Do not probe dynamic isReadOnly implementations with a dummy
+      // object while constructing the registry.
+      runMode: this.isReadOnlySession() ? "ask" : parent.runMode,
+      isSubagent: true,
       permissionContext: {
         ...parent.permissionContext,
         rules: {
@@ -318,6 +325,12 @@ export class SubAgentSession {
       },
     };
   }
+
+  private isReadOnlySession(): boolean {
+    return this.options.definition.isReadOnly
+      || this.options.parentConfig.permissionMode === "plan"
+      || this.options.parentConfig.runMode === "ask";
+  }
 }
 
 function extractFinalAssistantText(messages: CanonicalMessage[]): string {
@@ -325,7 +338,7 @@ function extractFinalAssistantText(messages: CanonicalMessage[]): string {
     const message = messages[i]!;
     if (message.role !== "assistant") continue;
     const parts: string[] = [];
-    for (const block of message.content) {
+    for (const block of messageContent(message)) {
       if (block.type === "text") parts.push(block.text);
     }
     if (parts.length > 0) return parts.join("\n").trim();

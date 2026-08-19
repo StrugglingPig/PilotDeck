@@ -3,6 +3,7 @@ import fsPromises from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parseGatewayConfig } from '../../../src/pilot/config/parseGatewayConfig.js';
 
 // Source of truth: ~/.pilotdeck/pilotdeck.yaml. The disk format and the
 // "internal" config object are the same V2 schema — no more adapter layer.
@@ -12,7 +13,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 //   agent:    { model: "provider/model", params, subagents }
 //   model:    { providers: { [pid]: { protocol, url, apiKey, models, headers, timeoutMs } } }
 //   memory:   { enabled, model, apiType?, reasoningMode, ... }
-//   webui:    { runtime: { host, serverPort, vitePort, proxyPort, ... } }
+//   webui:    { runtime: { host, serverPort, vitePort, ... } }
 //   router:   { enabled, stats: { enabled, modelPricing }, ... }
 //   gateway:  { enabled, home, ... }
 //   alwaysOn: { enabled, trigger, dormancy, workspace, execution, projects }
@@ -29,6 +30,15 @@ const MASK = '********';
 
 const SECRET_KEY_RE = /(api[_-]?key|token|secret|password|auth[_-]?token|access[_-]?token|bot[_-]?token|app[_-]?token|encoding[_-]?aes[_-]?key)$/i;
 const SECRET_EXACT_KEYS = new Set(['key', 'apiKey', 'api_key', 'authToken', 'accessToken']);
+let configWriteQueue = Promise.resolve();
+
+// Serialize every read-modify-write caller against the same local YAML file.
+// The callback must read the config inside this critical section.
+export function withPilotDeckConfigWrite(operation) {
+  const run = configWriteQueue.then(operation, operation);
+  configWriteQueue = run.catch(() => undefined);
+  return run;
+}
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -85,20 +95,53 @@ export function buildDefaultPilotDeckConfig() {
         host: '0.0.0.0',
         serverPort: 3001,
         vitePort: 5173,
-        proxyPort: 18080,
         apiTimeoutMs: 120000,
-        httpsProxy: '',
         databasePath: path.join(PILOT_HOME_DIR, 'auth.db'),
         workspacesRoot: os.homedir(),
       },
+      officePreview: {
+        service: 'builtin',
+        binaryPath: '',
+      },
+    },
+    telemetry: {
+      enabled: false,
     },
   };
 }
 
-// `normalize` here means "fill in missing top-level sections with defaults"
-// — it never reshapes. Idempotent.
+// Fill in missing sections and migrate legacy Office preview settings into the
+// current schema. The migration is idempotent.
 export function normalizePilotDeckConfig(input) {
-  return deepMerge(buildDefaultPilotDeckConfig(), isRecord(input) ? input : {});
+  const source = isRecord(input) ? input : {};
+  const normalized = deepMerge(buildDefaultPilotDeckConfig(), source);
+  const sourceOfficePreview = isRecord(source.webui?.officePreview)
+    ? source.webui.officePreview
+    : {};
+  const legacySpreadsheetMode = normalizeString(
+    sourceOfficePreview.spreadsheetMode,
+  ).toLowerCase();
+  const configuredService = normalizeString(sourceOfficePreview.service).toLowerCase();
+
+  // Before the built-in OOXML viewers existed, `service` only controlled
+  // LibreOffice conversion and Excel had a separate `spreadsheetMode`.
+  // Preserve the view users actually selected when migrating that shape:
+  // interactive/auto -> built-in, print -> LibreOffice.
+  if (legacySpreadsheetMode) {
+    normalized.webui.officePreview.service =
+      legacySpreadsheetMode === 'print' && configuredService === 'libreoffice'
+        ? 'libreoffice'
+        : 'builtin';
+  } else if (!configuredService || configuredService === 'none') {
+    normalized.webui.officePreview.service = 'builtin';
+  } else {
+    // Keep unknown values intact so validation can reject typos instead of
+    // silently changing a user's explicit choice.
+    normalized.webui.officePreview.service = configuredService;
+  }
+  delete normalized.webui.officePreview.spreadsheetMode;
+
+  return normalized;
 }
 
 // Strip surrounding whitespace from provider apiKey + url before they
@@ -112,10 +155,13 @@ export function sanitizeProviderCredentials(config) {
   if (!isRecord(config)) return config;
   const providers = config?.model?.providers;
   if (!isRecord(providers)) return config;
-  for (const provider of Object.values(providers)) {
+  for (const [providerId, provider] of Object.entries(providers)) {
     if (!isRecord(provider)) continue;
     if (typeof provider.apiKey === 'string') {
       provider.apiKey = provider.apiKey.trim();
+      if (allowsMissingApiKey(providerId) && provider.apiKey.length === 0) {
+        delete provider.apiKey;
+      }
     }
     if (typeof provider.url === 'string') {
       provider.url = provider.url.trim();
@@ -153,17 +199,30 @@ export function resolveModel(config, ref, options = {}) {
     if (options.allowMissing) return null;
     throw new Error(`Provider not found for model "${effective}": ${parts.providerId}`);
   }
-  const def = isRecord(provider.models) ? provider.models[parts.modelId] : null;
+  const models = isRecord(provider.models) ? provider.models : {};
+  if (!Object.prototype.hasOwnProperty.call(models, parts.modelId)) {
+    if (options.allowMissing) return null;
+    throw new Error(`Model not found for provider "${parts.providerId}": ${parts.modelId}`);
+  }
+  const rawDef = models[parts.modelId];
+  if (rawDef !== null && rawDef !== undefined && !isRecord(rawDef)) {
+    if (options.allowMissing) return null;
+    throw new Error(`Model definition for provider "${parts.providerId}" must be an object: ${parts.modelId}`);
+  }
   return {
     id: effective,
     providerId: parts.providerId,
     provider,
     model: parts.modelId,
-    def: isRecord(def) ? def : {},
+    def: isRecord(rawDef) ? rawDef : {},
   };
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────
+
+function allowsMissingApiKey(providerId) {
+  return providerId === 'ollama';
+}
 
 function validateProvider(id, provider, errors) {
   if (!isRecord(provider)) {
@@ -172,11 +231,13 @@ function validateProvider(id, provider, errors) {
   }
   const protocol = normalizeString(provider.protocol).toLowerCase();
   if (!protocol) errors.push(`model.providers.${id}.protocol is required`);
-  else if (protocol !== 'openai' && protocol !== 'anthropic') {
-    errors.push(`model.providers.${id}.protocol must be "openai" or "anthropic"`);
+  else if (protocol !== 'openai' && protocol !== 'openai-responses' && protocol !== 'anthropic' && protocol !== 'google') {
+    errors.push(`model.providers.${id}.protocol must be "openai", "openai-responses", "anthropic", or "google"`);
   }
   if (!normalizeString(provider.url)) errors.push(`model.providers.${id}.url is required`);
-  if (!normalizeString(provider.apiKey)) errors.push(`model.providers.${id}.apiKey is required`);
+  if (!allowsMissingApiKey(id) && !normalizeString(provider.apiKey)) {
+    errors.push(`model.providers.${id}.apiKey is required`);
+  }
 }
 
 function validateModelRef(config, ref, label, errors) {
@@ -187,9 +248,20 @@ function validateModelRef(config, ref, label, errors) {
   }
 }
 
+function validateOptionalSubagentDefault(config, warnings) {
+  const modelRef = normalizeString(config.agent?.subagents?.default);
+  if (!modelRef || modelRef === 'inherit') return;
+  if (!resolveModel(config, modelRef, { allowMissing: true })) {
+    warnings.push(
+      `agent.subagents.default="${modelRef}" doesn't resolve to a configured provider/model; subagents will inherit agent.model`,
+    );
+  }
+}
+
 function validateRouterModelRefs(config, errors) {
   const router = config.router;
   if (!isRecord(router)) return;
+  if (router.enabled === false) return;
 
   if (isRecord(router.scenarios)) {
     for (const [key, ref] of Object.entries(router.scenarios)) {
@@ -213,6 +285,19 @@ function validateRouterModelRefs(config, errors) {
     for (const [key, tier] of Object.entries(tokenSaver.tiers)) {
       if (!isRecord(tier)) continue;
       validateModelRef(config, tier.model, `router.tokenSaver.tiers.${key}.model`, errors);
+    }
+  }
+}
+
+function validateGatewayConfig(config, errors, warnings) {
+  const diagnostics = [];
+  parseGatewayConfig(config.gateway, diagnostics);
+  for (const diagnostic of diagnostics) {
+    const message = diagnostic.path ? `${diagnostic.path}: ${diagnostic.message}` : diagnostic.message;
+    if (diagnostic.severity === 'warning') {
+      warnings.push(message);
+    } else {
+      errors.push(message);
     }
   }
 }
@@ -244,7 +329,9 @@ export function validatePilotDeckConfig(config) {
     }
   }
 
+  validateOptionalSubagentDefault(normalized, warnings);
   validateRouterModelRefs(normalized, errors);
+  validateGatewayConfig(normalized, errors, warnings);
 
   if (normalized.webui?.runtime?.contextWindow !== undefined) {
     warnings.push(
@@ -253,6 +340,17 @@ export function validatePilotDeckConfig(config) {
     );
   }
 
+  const officePreviewService = normalized.webui?.officePreview?.service;
+  if (
+    officePreviewService !== undefined
+    && !['builtin', 'libreoffice'].includes(normalizeString(officePreviewService).toLowerCase())
+  ) {
+    errors.push('webui.officePreview.service must be "builtin" or "libreoffice"');
+  }
+  const libreOfficeBinaryPath = normalized.webui?.officePreview?.binaryPath;
+  if (libreOfficeBinaryPath !== undefined && typeof libreOfficeBinaryPath !== 'string') {
+    errors.push('webui.officePreview.binaryPath must be a string');
+  }
   return { valid: errors.length === 0, errors, warnings, config: normalized };
 }
 
@@ -293,12 +391,21 @@ export function preserveMaskedSecrets(nextValue, previousValue) {
   return nextValue;
 }
 
+export function hasUnresolvedMaskedSecrets(value) {
+  if (Array.isArray(value)) return value.some(hasUnresolvedMaskedSecrets);
+  if (!isRecord(value)) return false;
+  for (const [key, child] of Object.entries(value)) {
+    if (isSecretKey(key) && child === MASK) return true;
+    if (hasUnresolvedMaskedSecrets(child)) return true;
+  }
+  return false;
+}
+
 // ─── Runtime env derivation ──────────────────────────────────────────────────
 
 function providerProtocolToMemoryApi(protocol) {
-  // V2 catalog only uses 'openai' (Chat Completions) and 'anthropic'.
-  // The /responses style is only relevant when a user manually sets
-  // memory.apiType, which they can do alongside protocol="openai".
+  if (protocol === 'anthropic' || protocol === 'google') return protocol;
+  if (protocol === 'openai-responses') return 'openai-responses';
   return 'openai-completions';
 }
 
@@ -306,11 +413,8 @@ export function buildRuntimeEnv(config) {
   const normalized = normalizePilotDeckConfig(config);
   const main = resolveModel(normalized, normalized.agent.model, { allowMissing: true });
   const runtime = normalized.webui?.runtime ?? {};
-  const proxyPort = String(runtime.proxyPort ?? 18080);
 
   const env = {
-    PILOTDECK_PROXY_PORT: process.env.PILOTDECK_PROXY_PORT || proxyPort,
-    PROXY_PORT: process.env.PROXY_PORT || proxyPort,
     SERVER_PORT: process.env.SERVER_PORT || String(runtime.serverPort ?? 3001),
     VITE_PORT: process.env.VITE_PORT || String(runtime.vitePort ?? 5173),
     HOST: process.env.HOST || String(runtime.host ?? '0.0.0.0'),
@@ -320,9 +424,12 @@ export function buildRuntimeEnv(config) {
 
   if (runtime.databasePath) env.DATABASE_PATH = expandTilde(runtime.databasePath);
   if (runtime.workspacesRoot) env.WORKSPACES_ROOT = expandTilde(runtime.workspacesRoot);
-  if (runtime.httpsProxy) {
-    env.HTTPS_PROXY = runtime.httpsProxy;
-    env.https_proxy = runtime.httpsProxy;
+  const proxyUrl = normalized.proxy?.url
+    || (typeof normalized.proxy === 'string' ? normalized.proxy : '')
+    || runtime.httpsProxy || '';
+  if (proxyUrl) {
+    env.HTTPS_PROXY = proxyUrl;
+    env.https_proxy = proxyUrl;
   }
 
   if (main) {
@@ -334,8 +441,11 @@ export function buildRuntimeEnv(config) {
     env.OPENAI_MODEL = main.model;
     env.ANTHROPIC_API_KEY = main.provider.apiKey || '';
     env.ANTHROPIC_MODEL = main.model;
+    env.GEMINI_API_KEY = main.provider.apiKey || '';
+    env.GOOGLE_API_KEY = main.provider.apiKey || '';
+    env.GOOGLE_GENERATIVE_AI_API_KEY = main.provider.apiKey || '';
+    env.GEMINI_MODEL = main.model;
   }
-  env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${proxyPort}`;
 
   // Reasoning models (DeepSeek-R1, MiniMax-M2.7, etc.) need a generous
   // output token cap; honor agent.params.maxOutputTokens / max_tokens.
@@ -436,12 +546,25 @@ export function readPilotDeckConfigFile() {
       raw: '',
       config: buildDefaultPilotDeckConfig(),
       rawYaml: {},
+      parseError: null,
     };
   }
   const raw = fs.readFileSync(configPath, 'utf8');
-  const parsed = parseYaml(raw) || {};
+  let parsed;
+  try {
+    parsed = parseYaml(raw) || {};
+  } catch (error) {
+    return {
+      exists: true,
+      configPath,
+      raw,
+      config: buildDefaultPilotDeckConfig(),
+      rawYaml: null,
+      parseError: error instanceof Error ? error.message : String(error),
+    };
+  }
   const config = normalizePilotDeckConfig(parsed);
-  return { exists: true, configPath, raw, config, rawYaml: parsed };
+  return { exists: true, configPath, raw, config, rawYaml: parsed, parseError: null };
 }
 
 // Keep `router.scenarios.default` aligned with `agent.model` whenever we
@@ -466,6 +589,7 @@ export function syncAgentModelWithRouter(config) {
   const modelId = agentRef.slice(slash + 1);
 
   if (!isRecord(config.router)) return config;
+  if (config.router.enabled === false) return config;
   if (!isRecord(config.router.scenarios)) return config;
   const currentDefault = config.router.scenarios.default;
   // Accept both string ("provider/model") and object ref shapes.
@@ -506,6 +630,11 @@ function purgeBootstrapPlaceholder(config) {
         config.agent.model = `${firstProvider}/${models[0]}`;
       }
     }
+  }
+
+  const subagentDefault = normalizeString(config?.agent?.subagents?.default);
+  if (subagentDefault && subagentDefault !== 'inherit' && !resolveModel(config, subagentDefault, { allowMissing: true })) {
+    config.agent.subagents.default = 'inherit';
   }
 
   const router = config?.router;
@@ -560,6 +689,12 @@ export async function writePilotDeckConfig(config) {
       ),
     ),
   );
+  if (isRecord(sanitized.memory)) {
+    const memModel = sanitized.memory.model;
+    if (typeof memModel === 'string' && !memModel.trim()) {
+      delete sanitized.memory.model;
+    }
+  }
   const validation = validatePilotDeckConfig(sanitized);
   if (!validation.valid) {
     const error = new Error('Invalid PilotDeck config');
@@ -569,6 +704,12 @@ export async function writePilotDeckConfig(config) {
   const configPath = getPilotDeckConfigPath();
   await fsPromises.mkdir(path.dirname(configPath), { recursive: true });
   const yamlObj = validation.config;
+  if (isRecord(yamlObj.memory)) {
+    const memModel = yamlObj.memory.model;
+    if (typeof memModel === 'string' && !memModel.trim()) {
+      delete yamlObj.memory.model;
+    }
+  }
   const raw = stringifyYaml(yamlObj, { lineWidth: 0 });
   await fsPromises.writeFile(configPath, raw, 'utf8');
   return { configPath, raw, validation, config: yamlObj };

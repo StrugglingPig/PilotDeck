@@ -14,6 +14,7 @@ export type {
   ContextRecoveryDecision,
   ContextRecoveryInput,
   ContextRuntime,
+  ContextSupplementalToolResultMessage,
   ContextToolResultInput,
   ContextToolResultResult,
   ModelContext,
@@ -31,6 +32,7 @@ export {
 } from "./projection/MessageProjector.js";
 export {
   DEFAULT_MAX_RESULT_SIZE_CHARS,
+  DEFAULT_MAX_RESULT_SIZE_TOKENS,
   PREVIEW_SIZE_BYTES,
   ToolResultBudget,
   createToolResultBudgetState,
@@ -54,10 +56,22 @@ export {
 export {
   IMAGE_MAX_TOKEN_SIZE,
   TokenBudgetManager,
+  type TokenBudgetEvaluateOptions,
   type TokenBudgetManagerOptions,
   type TokenBudgetSnapshot,
   type TokenWarningState,
 } from "./budget/TokenBudgetManager.js";
+export {
+  actualInputTokensFromUsage,
+  TokenAccountingRuntime,
+  type CountRequestInputOptions,
+  type EvaluateRequestBudgetOptions,
+  type TokenCalibrationBaseline,
+  type TokenAccountingRuntimeOptions,
+  type TokenCountResult,
+  type TokenCountSource,
+} from "./budget/TokenAccountingRuntime.js";
+export { effectiveInputContextTokens } from "./budget/effectiveContext.js";
 export { countTokens, getTokenizer } from "./budget/tokenizer.js";
 export {
   CompactionEngine,
@@ -78,6 +92,8 @@ export {
 export {
   MicroCompactionEngine,
   MICROCOMPACT_CLEARED,
+  MICROCOMPACT_FAILURES_FOLDED,
+  MICROCOMPACT_RECOVERED_FAILURE_PREFIX,
   type MicroCompactionInput,
   type MicroCompactionResult,
 } from "./compaction/MicroCompactionEngine.js";
@@ -108,6 +124,18 @@ export {
   stripUnpairedToolCalls,
   stripUnpairedToolResults,
 } from "./compaction/toolPairIntegrity.js";
+export {
+  DEFAULT_PROTECTED_TOOL_RESULT_NAMES,
+  collectProtectedTurnIndexes,
+  collectToolNamesByCallId,
+  isProtectedContextMessage,
+  isProtectedToolCallId,
+  protectedToolNameSet,
+  splitMessagesIntoTurns,
+  type MessageTurn,
+  type ProtectedContextMessageOptions,
+  type ProtectedContextOptions,
+} from "./compaction/protectedContext.js";
 export {
   NullExtensionResolver,
   type ContributedCommand,

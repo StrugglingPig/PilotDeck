@@ -3,10 +3,12 @@ import type {
   CanonicalModelRequest,
   CanonicalModelResponse,
   ModelConfig,
+  ModelProtocol,
 } from "./protocol/canonical.js";
 import type { ModelCapabilities } from "./protocol/capabilities.js";
 import { ModelRequestError } from "./protocol/errors.js";
 import type { MultimodalConstraints } from "./protocol/multimodal.js";
+import { normalizeProviderBaseUrl } from "./normalizeProviderBaseUrl.js";
 import { complete, streamModel, type ModelRuntimeOptions } from "./streaming/streamModel.js";
 
 export interface ModelRuntime {
@@ -14,6 +16,8 @@ export interface ModelRuntime {
   complete(request: CanonicalModelRequest, options?: ModelRuntimeOptions): Promise<CanonicalModelResponse>;
   getCapabilities(providerId: string, modelId: string): ModelCapabilities;
   getMultimodal(providerId: string, modelId: string): MultimodalConstraints;
+  getProviderProtocol(providerId: string): ModelProtocol | undefined;
+  getProviderBaseUrl(providerId: string): string | undefined;
 }
 
 export function createModelRuntime(
@@ -42,5 +46,10 @@ export function createModelRuntime(
     complete: (request, callOptions) => complete(request, config, { ...options, ...callOptions }),
     getCapabilities: (providerId, modelId) => getModel(providerId, modelId).capabilities,
     getMultimodal: (providerId, modelId) => getModel(providerId, modelId).multimodal,
+    getProviderProtocol: (providerId) => config.providers[providerId]?.protocol,
+    getProviderBaseUrl: (providerId) => {
+      const url = config.providers[providerId]?.url;
+      return url ? normalizeProviderBaseUrl(url) : undefined;
+    },
   };
 }

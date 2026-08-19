@@ -19,7 +19,7 @@ import {
   appendAlwaysOnRunLogEvent,
   formatAlwaysOnPlanLogLine,
 } from './services/always-on-run-logs.js';
-import { resolvePilotHome, createProjectId } from './utils/pilotPaths.js';
+import { resolvePilotHome, resolveProjectStorageId } from './utils/pilotPaths.js';
 
 import { DiscoveryPlanService } from '../../src/always-on/web/DiscoveryPlanService.js';
 import { buildDiscoveryContext } from '../../src/always-on/web/DiscoveryPlanContext.js';
@@ -27,15 +27,18 @@ import {
   applyWorktreeToProject,
   disposeWorkspace as disposeWorkspaceImpl,
 } from '../../src/always-on/workspace/WorkspaceApply.js';
+import { resolveAlwaysOnPaths } from '../../src/always-on/storage/AlwaysOnPaths.js';
+import { DiscoveryStateStore } from '../../src/always-on/storage/DiscoveryStateStore.js';
 
 // ---------------------------------------------------------------------------
 // Wire dependencies for the service
 // ---------------------------------------------------------------------------
 
 function getService() {
+  const pilotHome = resolvePilotHome();
   return new DiscoveryPlanService({
-    pilotHome: resolvePilotHome(),
-    createProjectId,
+    pilotHome,
+    resolveProjectId: (projectRoot) => resolveProjectStorageId(projectRoot, pilotHome),
     paths: { extractProjectDirectory },
     sessions: { getSessions },
     activity: { isSessionActive: isClaudeSDKSessionActive },
@@ -48,6 +51,16 @@ function getService() {
     workspace: {
       applyWorktreeChanges: applyWorktreeToProject,
       disposeWorkspace: disposeWorkspaceImpl,
+    },
+    state: {
+      clearActiveWorkCycleId: async (projectRoot) => {
+        const paths = resolveAlwaysOnPaths({
+          pilotHome,
+          projectKey: projectRoot,
+        });
+        const store = new DiscoveryStateStore(paths);
+        await store.clearActiveWorkCycleId(new Date());
+      },
     },
   });
 }

@@ -4,6 +4,7 @@ import { mkdirSync } from 'fs';
 import os from 'os';
 import { spawn } from 'child_process';
 import { sendCronDaemonRequest } from './cron-daemon-owner.js';
+import { prepareBackgroundSpawnOptions } from '../utils/processSpawn.js';
 
 // Cron daemon entry point. The launcher script is discoverable on PATH
 // or supplied via PILOTDECK_CRON_DAEMON_BIN. Returning `null` falls back
@@ -15,8 +16,6 @@ function resolvePilotDeckMainRoot() {
 const DEFAULT_RETRY_ATTEMPTS = 20;
 const DEFAULT_RETRY_DELAY_MS = 250;
 const START_LOCK_STALE_MS = 30000;
-const CCR_SENTINEL = 'http://ccr.local';
-const CCR_DAEMON_FETCH_INTERCEPTOR = 'CCR_DAEMON_FETCH_INTERCEPTOR';
 
 function getPilotDeckConfigHomeDir() {
   return process.env.PILOTDECK_CONFIG_DIR || process.env.PILOT_HOME || path.join(os.homedir(), '.pilotdeck');
@@ -73,11 +72,7 @@ export function isCronDaemonUnavailableError(error) {
 }
 
 export function buildCronDaemonEnv(baseEnv = process.env) {
-  const env = { ...baseEnv };
-  if (env.ANTHROPIC_BASE_URL === CCR_SENTINEL) {
-    env[CCR_DAEMON_FETCH_INTERCEPTOR] = '1';
-  }
-  return env;
+  return { ...baseEnv };
 }
 
 export function buildCronDaemonSpawnCommand({
@@ -155,12 +150,12 @@ export function startCronDaemonDetached({
   const stdio = fd === null ? 'ignore' : ['ignore', fd, fd];
   let child;
   try {
-    child = spawnFn(command, args, {
+    child = spawnFn(command, args, prepareBackgroundSpawnOptions({
       cwd: process.cwd(),
       env: buildCronDaemonEnv(),
       detached: true,
-      stdio
-    });
+      stdio,
+    }));
   } catch (err) {
     console.warn(`[WARN] Cron daemon spawn failed: ${err.message}`);
     return null;

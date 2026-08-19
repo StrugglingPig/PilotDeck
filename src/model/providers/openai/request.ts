@@ -4,11 +4,18 @@ import type {
   CanonicalMessage,
   CanonicalModelRequest,
   CanonicalPdfBlock,
+  CanonicalThinkingBlock,
   CanonicalToolChoice,
   CanonicalToolSchema,
   ModelDefinition,
+  ProviderConfig,
 } from "../../protocol/canonical.js";
 import { flattenToolResultBlockText } from "../../protocol/toolResultContent.js";
+import { messageContent } from "../../protocol/clone.js";
+import { cleanSchemaForGoogle, normalizeGoogleToolSchema } from "../google/schema.js";
+import { normalizeOpenAISchema } from "./schema.js";
+import { resolveThinkingPlan, throwIfUnsupportedThinkingPlan } from "../../thinking/registry.js";
+import { formatToolResultReferenceText } from "../toolResultReferenceText.js";
 
 export type OpenAIRequestBody = {
   model: string;
@@ -19,6 +26,10 @@ export type OpenAIRequestBody = {
   temperature?: number;
   stream?: boolean;
   metadata?: Record<string, unknown>;
+  reasoning?: { effort?: string };
+  thinking?: Record<string, unknown>;
+  reasoning_effort?: string;
+  reasoning_split?: boolean;
   /**
    * Provider-native structured output. Set when `request.outputSchema` is
    * provided. `strict` defaults to true unless the schema opts out.
@@ -54,7 +65,11 @@ type OpenAITool = {
 export function buildOpenAIRequest(
   request: CanonicalModelRequest,
   model: ModelDefinition,
+  provider?: ProviderConfig,
 ): OpenAIRequestBody {
+  const googleOpenAICompatible = isGoogleOpenAICompatibleProvider(provider);
+  const thinkingPlan = resolveThinkingPlan(request.thinking, provider ?? { id: "openai", protocol: "openai", url: "", apiKey: "", headers: {}, models: {} }, model);
+  throwIfUnsupportedThinkingPlan(thinkingPlan, request);
   const messages = repairOpenAIToolPairing(
     request.messages.flatMap((message, messageIndex) => toOpenAIMessages(message, messageIndex)),
   );
@@ -66,9 +81,9 @@ export function buildOpenAIRequest(
     model: request.model,
     messages,
     max_tokens: request.maxOutputTokens ?? model.capabilities.maxOutputTokens,
-    tools: request.tools?.map(toOpenAITool),
+    tools: request.tools?.map((tool) => toOpenAITool(tool, googleOpenAICompatible)),
     tool_choice: toOpenAIToolChoice(request.toolChoice),
-    temperature: request.temperature,
+    temperature: thinkingPlan.omitTemperature ? undefined : request.temperature,
     stream: request.stream,
     metadata: request.metadata
       ? Object.fromEntries(
@@ -83,33 +98,69 @@ export function buildOpenAIRequest(
       json_schema: {
         name: request.outputSchema.name,
         description: request.outputSchema.description,
-        schema: request.outputSchema.schema,
+        schema: googleOpenAICompatible
+          ? normalizeGoogleOpenAIResponseSchema(request.outputSchema.schema)
+          : normalizeOpenAISchema(request.outputSchema.schema),
         strict: request.outputSchema.strict ?? true,
       },
     };
   }
 
+  if (thinkingPlan.useOpenAIReasoning && thinkingPlan.effort) {
+    body.reasoning = { effort: thinkingPlan.effort };
+  } else if (thinkingPlan.bodyPatch) {
+    Object.assign(body, thinkingPlan.bodyPatch);
+  } else if (thinkingPlan.useOpenAICompatibleThinking) {
+    if (thinkingPlan.thinkingType) {
+      body.thinking = { type: thinkingPlan.thinkingType };
+    } else if (thinkingPlan.enabled) {
+      body.thinking = { type: "enabled" };
+    }
+    if (thinkingPlan.effort) {
+      body.reasoning_effort = thinkingPlan.effort;
+    }
+  } else if (thinkingPlan.splitReasoning) {
+    body.reasoning_split = true;
+  } else if (request.thinking?.enabled) {
+    (body as Record<string, unknown>).enable_thinking = true;
+    const budget = request.thinking.budgetTokens;
+    if (googleOpenAICompatible) {
+      if (typeof budget === "number" && Number.isFinite(budget) && budget >= 0) {
+        (body as Record<string, unknown>).thinking_budget = budget;
+      }
+    } else if (budget) {
+      (body as Record<string, unknown>).thinking_budget = budget;
+    }
+  }
+
   return body;
 }
 
-function toOpenAIMessages(message: CanonicalMessage, messageIndex: number): OpenAIMessage[] {
+function toOpenAIMessages(
+  message: CanonicalMessage,
+  messageIndex: number,
+): OpenAIMessage[] {
   if (message.role === "user") {
     return toOpenAIUserMessages(message);
   }
 
-  const toolResultBlocks = message.content
+  const content = messageContent(message);
+
+  const toolResultBlocks = content
     .filter((block) => block.type === "tool_result");
   const toolResultMessages = toolResultBlocks.map(toOpenAIToolResultMessage);
   const toolResultVisualMessages = toolResultBlocks.flatMap(toOpenAIToolResultVisualMessages);
 
-  const toolResultRefMessages = message.content
+  const toolResultRefMessages = content
     .filter((block) => block.type === "tool_result_reference")
     .map(toOpenAIToolResultReferenceMessage);
 
-  const assistantToolCalls = message.content
+  const assistantToolCalls = content
     .filter((block) => block.type === "tool_call")
-    .map((block, toolCallIndex) => ({
-      id: normalizeToolCallId(block.id, messageIndex, toolCallIndex),
+    .map((block) => ({
+      // Preserve the canonical id until `repairOpenAIToolPairing` can see the
+      // adjacent tool results and rewrite both sides together.
+      id: block.id,
       type: "function",
       function: {
         name: block.name,
@@ -117,8 +168,10 @@ function toOpenAIMessages(message: CanonicalMessage, messageIndex: number): Open
       },
     }));
 
-  const thinkingBlocks = message.content.filter((block) => block.type === "thinking");
-  const normalContent = message.content.filter(
+  const thinkingBlocks = content.filter(
+    (block): block is CanonicalThinkingBlock => block.type === "thinking",
+  );
+  const normalContent = content.filter(
     (block) =>
       block.type !== "tool_result" &&
       block.type !== "tool_result_reference" &&
@@ -135,10 +188,9 @@ function toOpenAIMessages(message: CanonicalMessage, messageIndex: number): Open
         : (message.role === "assistant" && thinkingBlocks.length > 0 ? "" : undefined),
       tool_calls: assistantToolCalls.length > 0 ? assistantToolCalls : undefined,
     };
-    // DeepSeek V4 requires reasoning_content to be passed back on assistant
-    // messages in multi-turn conversations; omitting it causes a 400 error.
-    if (message.role === "assistant" && thinkingBlocks.length > 0) {
-      msg.reasoning_content = thinkingBlocks.map((b) => b.text).join("\n");
+    const reasoningContent = toOpenAIReasoningContent(thinkingBlocks);
+    if (reasoningContent !== undefined) {
+      msg.reasoning_content = reasoningContent;
     }
     messages.push(msg);
   }
@@ -149,6 +201,7 @@ function toOpenAIMessages(message: CanonicalMessage, messageIndex: number): Open
 function toOpenAIUserMessages(message: CanonicalMessage): OpenAIMessage[] {
   const messages: OpenAIMessage[] = [];
   let normalContent: CanonicalContentBlock[] = [];
+  const content = messageContent(message);
 
   const flushNormalContent = () => {
     if (normalContent.length === 0) return;
@@ -159,13 +212,13 @@ function toOpenAIUserMessages(message: CanonicalMessage): OpenAIMessage[] {
     normalContent = [];
   };
 
-  for (let i = 0; i < message.content.length; i += 1) {
-    const block = message.content[i];
+  for (let i = 0; i < content.length; i += 1) {
+    const block = content[i]!;
     if (block.type === "tool_result") {
       flushNormalContent();
       const visualContent: CanonicalContentBlock[] = [];
-      while (i < message.content.length) {
-        const toolBlock = message.content[i];
+      while (i < content.length) {
+        const toolBlock = content[i]!;
         if (toolBlock.type === "tool_result") {
           messages.push(toOpenAIToolResultMessage(toolBlock));
           visualContent.push(...toolResultVisualContent(toolBlock));
@@ -244,9 +297,7 @@ function toOpenAIToolResultReferenceMessage(
   return {
     role: "tool",
     tool_call_id: block.toolCallId,
-    content: block.preview + (block.hasMore
-      ? `\n\n[Truncated: original ${block.originalBytes} bytes, file: ${block.path}]`
-      : ""),
+    content: formatToolResultReferenceText(block),
   };
 }
 
@@ -285,51 +336,63 @@ function toOpenAIContent(blocks: CanonicalContentBlock[]): string | unknown[] {
         return undefined;
       case "tool_result_reference":
         return { type: "text", text: block.preview };
+      case "media_reference":
+        return { type: "text", text: block.preview };
     }
   }).filter(Boolean);
 }
 
-function toOpenAITool(tool: CanonicalToolSchema): OpenAITool {
+function toOpenAIReasoningContent(
+  thinkingBlocks: CanonicalThinkingBlock[],
+): string | undefined {
+  const contexts = thinkingBlocks
+    .map((block) => block.reasoningContent ?? block.text)
+    .filter((text) => text.length > 0);
+
+  if (contexts.length === 0 && thinkingBlocks.length > 0) {
+    return "";
+  }
+
+  return contexts.length > 0 ? contexts.join("\n") : undefined;
+}
+
+function toOpenAITool(tool: CanonicalToolSchema, googleOpenAICompatible: boolean): OpenAITool {
   return {
     type: "function",
     function: {
       name: tool.name,
       description: tool.description,
-      parameters: normalizeOpenAISchema(tool.inputSchema),
+      parameters: googleOpenAICompatible
+        ? normalizeGoogleToolSchema(tool.inputSchema)
+        : normalizeOpenAISchema(tool.inputSchema),
     },
   };
 }
 
-/**
- * Azure/OpenAI-compatible endpoints can require `items` whenever a schema node
- * allows `array` (including union types like `type: ["string", "array"]`).
- * Normalize tool input schemas defensively to avoid provider-side 400s.
- */
-function normalizeOpenAISchema(schema: Record<string, unknown>): Record<string, unknown> {
-  return normalizeOpenAISchemaNode(schema) as Record<string, unknown>;
+function normalizeGoogleOpenAIResponseSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const cleaned = cleanSchemaForGoogle(schema);
+  return cleaned && typeof cleaned === "object" && !Array.isArray(cleaned)
+    ? cleaned as Record<string, unknown>
+    : {};
 }
 
-function normalizeOpenAISchemaNode(node: unknown): unknown {
-  if (Array.isArray(node)) {
-    return node.map(normalizeOpenAISchemaNode);
+function isGoogleOpenAICompatibleProvider(provider: ProviderConfig | undefined): boolean {
+  if (!provider || provider.protocol !== "openai") {
+    return false;
   }
-  if (!isRecord(node)) {
-    return node;
-  }
-
-  const normalized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(node)) {
-    normalized[key] = normalizeOpenAISchemaNode(value);
+  if (provider.id === "google") {
+    return true;
   }
 
-  const typeField = normalized.type;
-  const allowsArray = typeField === "array"
-    || (Array.isArray(typeField) && typeField.includes("array"));
-  if (allowsArray && !("items" in normalized)) {
-    normalized.items = {};
+  const rawUrl = provider.url.trim().toLowerCase();
+  try {
+    const url = new URL(rawUrl);
+    return url.hostname === "generativelanguage.googleapis.com"
+      && url.pathname.includes("/openai");
+  } catch {
+    return rawUrl.includes("generativelanguage.googleapis.com")
+      && rawUrl.includes("/openai");
   }
-
-  return normalized;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -342,11 +405,17 @@ function normalizeToolCallId(id: unknown, messageIndex: number, toolCallIndex: n
     : `call_${messageIndex}_${toolCallIndex}`;
 }
 
+type NormalizedOpenAIToolCall = {
+  originalId?: string;
+  toolCall: { id: string; type: "function"; function: { name: string; arguments: string } };
+};
+
 /**
  * Last-resort safety net for OpenAI's strict tool-pairing rules:
  *  - normalize every assistant `tool_calls[]` item to the required shape;
+ *  - make assistant tool call ids unique, even for historical empty/duplicate ids;
  *  - keep only immediately-following tool messages whose `tool_call_id`
- *    matches that assistant message;
+ *    matches that assistant message, rewriting ids when they were normalized;
  *  - inject placeholders for missing tool results;
  *  - drop orphaned / duplicate / mismatched `role: "tool"` messages.
  */
@@ -362,42 +431,79 @@ function repairOpenAIToolPairing(messages: OpenAIMessage[]): OpenAIMessage[] {
       continue;
     }
 
-    const toolCalls = msg.tool_calls.map((toolCall, toolCallIndex) =>
-      normalizeOpenAIToolCall(toolCall, i, toolCallIndex)
-    );
-    out.push({ ...msg, tool_calls: toolCalls });
+    const expected = normalizeOpenAIToolCalls(msg.tool_calls, i);
+    out.push({ ...msg, tool_calls: expected.map((entry) => entry.toolCall) });
 
-    const expectedIds = new Set(toolCalls.map((tc) => tc.id));
-    const matchedIds = new Set<string>();
+    const matched = new Set<NormalizedOpenAIToolCall>();
     let j = i + 1;
     while (j < messages.length && messages[j].role === "tool") {
-      const tid = messages[j].tool_call_id;
-      if (
-        typeof tid === "string" &&
-        tid.trim().length > 0 &&
-        expectedIds.has(tid) &&
-        !matchedIds.has(tid)
-      ) {
-        out.push(messages[j]);
-        matchedIds.add(tid);
+      const match = takeExpectedToolCall(expected, matched, messages[j].tool_call_id);
+      if (match) {
+        out.push({ ...messages[j], tool_call_id: match.toolCall.id });
+        matched.add(match);
       }
       j++;
     }
 
     // Inject placeholders for any still-missing results.
-    for (const missingId of expectedIds) {
-      if (matchedIds.has(missingId)) {
+    for (const missing of expected) {
+      if (matched.has(missing)) {
         continue;
       }
       out.push({
         role: "tool",
-        tool_call_id: missingId,
+        tool_call_id: missing.toolCall.id,
         content: "[result truncated]",
       });
     }
     i = j - 1;
   }
   return out;
+}
+
+function normalizeOpenAIToolCalls(
+  toolCalls: unknown[],
+  messageIndex: number,
+): NormalizedOpenAIToolCall[] {
+  const used = new Set<string>();
+  return toolCalls.map((toolCall, toolCallIndex) => {
+    const record = isRecord(toolCall) ? toolCall : {};
+    const originalId = typeof record.id === "string" ? record.id.trim() : undefined;
+    const normalized = normalizeOpenAIToolCall(toolCall, messageIndex, toolCallIndex);
+    const id = nextUniqueToolCallId(normalized.id, used);
+    used.add(id);
+    return {
+      originalId,
+      toolCall: id === normalized.id ? normalized : { ...normalized, id },
+    };
+  });
+}
+
+function nextUniqueToolCallId(id: string, used: Set<string>): string {
+  if (!used.has(id)) {
+    return id;
+  }
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${id}_${suffix}`;
+    if (!used.has(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+function takeExpectedToolCall(
+  expected: NormalizedOpenAIToolCall[],
+  matched: Set<NormalizedOpenAIToolCall>,
+  toolCallId: unknown,
+): NormalizedOpenAIToolCall | undefined {
+  if (typeof toolCallId !== "string") {
+    return undefined;
+  }
+  const id = toolCallId.trim();
+  return expected.find((entry) =>
+    !matched.has(entry) &&
+    (entry.originalId === id || entry.toolCall.id === id)
+  );
 }
 
 function normalizeOpenAIToolCall(

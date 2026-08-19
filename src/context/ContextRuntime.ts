@@ -11,6 +11,7 @@ import type {
   ModelContext,
 } from "./protocol/types.js";
 import type { AutoCompactResult } from "./DefaultContextRuntime.js";
+import type { TokenBudgetSnapshot } from "./budget/TokenBudgetManager.js";
 
 export type AgentContextPrepareInput = ContextPrepareInput;
 export type AgentPreparedContext = ModelContext;
@@ -58,8 +59,14 @@ export type AgentContextRuntime = {
    * context window after a routing decision.
    */
   tryAutoCompact?(input: {
+    sessionId?: string;
+    turnId?: string;
     messages: CanonicalMessage[];
     abortSignal?: AbortSignal;
     maxContextTokens?: number;
+    reservedOutputTokens?: number;
+    /** Legacy compatibility flag; summary failures never fabricate a checkpoint. */
+    allowFallbackOnFailure?: boolean;
+    budgetEvaluator?: (messages: CanonicalMessage[]) => Promise<TokenBudgetSnapshot>;
   }): Promise<AutoCompactResult>;
 };

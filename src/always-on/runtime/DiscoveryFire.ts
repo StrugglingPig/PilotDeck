@@ -5,7 +5,7 @@ import type { Gateway, GatewayChannelKey, GatewayEvent } from "../../gateway/ind
 import { getPilotProjectChatDir } from "../../pilot/paths.js";
 import { buildChatDigest } from "../context/ChatDigestBuilder.js";
 import type { AlwaysOnConfig } from "../config/parseAlwaysOnConfig.js";
-import { buildFallbackReport, type ReportMetadata } from "../contracts/ReportContract.js";
+import { buildFallbackReport, parseReportMarkdown, type ReportMetadata } from "../contracts/ReportContract.js";
 import { AlwaysOnError } from "../protocol/errors.js";
 import type {
   AlwaysOnDiscoveryOutcome,
@@ -27,8 +27,12 @@ import type { WorkspaceProviderRegistry } from "../workspace/WorkspaceProviderRe
 import type { AlwaysOnRunContextRegistry, ExecutionRunContext, DiscoveryRunContext, WorkspaceRunContext, ReportRunContext } from "./AlwaysOnRunContextRegistry.js";
 import { generateWorkspaceDiff } from "../workspace/WorkspaceApply.js";
 import { buildDiscoveryPrompt, buildExecutionPrompt, buildWorkspacePrompt, buildReportPrompt, buildApplyPrompt } from "./discoveryPrompts.js";
-import type { SessionConfigOverrides } from "./SessionConfigOverrides.js";
+import {
+  UNATTENDED_SESSION_EXCLUDED_TOOLS,
+  type SessionConfigOverrides,
+} from "./SessionConfigOverrides.js";
 import type { PermissionRule } from "../../permission/index.js";
+import type { TelemetryClient } from "../../telemetry/index.js";
 
 export type DiscoveryFireDependencies = {
   config: AlwaysOnConfig;
@@ -47,6 +51,7 @@ export type DiscoveryFireDependencies = {
   now: () => Date;
   logger?: { info: (msg: string, data?: Record<string, unknown>) => void; warn: (msg: string, data?: Record<string, unknown>) => void };
   onTurnEvent?: (sessionKey: string, channelKey: string, event: GatewayEvent) => void;
+  telemetry?: TelemetryClient;
 };
 
 export type DiscoveryFireRunInput = {
@@ -62,16 +67,6 @@ const REPORT_CHANNEL: GatewayChannelKey = "always-on/report";
 const APPLY_CHANNEL: GatewayChannelKey = "always-on/apply";
 
 /**
- * Tools that require user interaction or could block an unattended session.
- * Excluded from all Always-On agent loops via SessionConfigOverride.excludeTools.
- */
-const ALWAYS_ON_EXCLUDED_TOOLS = [
-  "enter_plan_mode",
-  "exit_plan_mode",
-  "ask_user_question",
-];
-
-/**
  * Deny rules injected into the execution phase session. These override
  * `bypassPermissions` because deny rules always win in `PermissionRuntime.decide()`.
  * Prevents the agent from pushing code or modifying remote configuration.
@@ -83,10 +78,19 @@ export const ALWAYS_ON_EXECUTION_DENY_RULES: PermissionRule[] = [
   { source: "policy", behavior: "deny", toolName: "bash", pattern: "*git remote*" },
 ];
 
+function toTelemetryAlwaysOnPhase(phase: AlwaysOnEventPhase): "discovery" | "workspace" | "execution" | "report" | "apply" {
+  if (phase.startsWith("workspace_")) return "workspace";
+  if (phase.startsWith("execution_")) return "execution";
+  if (phase.startsWith("report_")) return "report";
+  if (phase.startsWith("apply_")) return "apply";
+  return "discovery";
+}
+
 export type EnsureActiveWorkCycleInput = {
   state: AlwaysOnDiscoveryState;
   projectKey: string;
   runId: string;
+  planTitle: string;
   cycleId: string;
   workspaceRegistry: WorkspaceProviderRegistry;
   stateStore: DiscoveryStateStore;
@@ -147,6 +151,7 @@ export async function ensureActiveWorkCycle(
   const prepared = await input.workspaceRegistry.prepare({
     projectRoot: input.projectKey,
     runId: input.runId,
+    planTitle: input.planTitle,
   });
   const cycle = await input.cycleStore.create(
     prepared.handle,
@@ -164,8 +169,46 @@ export class DiscoveryFire {
   private emitEvent(
     runId: string,
     phase: AlwaysOnEventPhase,
-    extra?: { title?: string; planId?: string; outcome?: AlwaysOnDiscoveryOutcome; error?: { code: string; message: string } },
+    extra?: {
+      title?: string;
+      planId?: string;
+      outcome?: AlwaysOnDiscoveryOutcome;
+      error?: { code: string; message: string };
+      telemetryPhase?: "discovery" | "workspace" | "execution" | "report" | "apply";
+    },
   ): void {
+    const telemetryPhase = extra?.telemetryPhase ?? toTelemetryAlwaysOnPhase(phase);
+    const { telemetryPhase: _telemetryPhase, ...eventExtra } = extra ?? {};
+    this.deps.telemetry?.trackFeatureLoopStage({
+      module: "always_on",
+      ownerModule: "always_on",
+      executionKind: "always_on",
+      phase: telemetryPhase,
+      loopStage: "module_event",
+      outcome: phase === "run_failed" ? "failed" : "success",
+      metadata: {
+        event: phase,
+        runId,
+        planId: extra?.planId,
+        outcome: extra?.outcome,
+      },
+    });
+    if (extra?.error) {
+      this.deps.telemetry?.trackError(extra.error.message, {
+        module: "always_on",
+        ownerModule: "always_on",
+        executionKind: "always_on",
+        phase: telemetryPhase,
+        loopStage: "loop_end",
+        errorCategory: "loop_error",
+        code: extra.error.code,
+        metadata: {
+          runId,
+          phase,
+          planId: extra.planId,
+        },
+      });
+    }
     this.deps.eventStore
       .appendEvent({
         schemaVersion: 1,
@@ -174,7 +217,7 @@ export class DiscoveryFire {
         projectKey: this.deps.projectKey,
         phase,
         timestamp: this.deps.now().toISOString(),
-        ...extra,
+        ...eventExtra,
       })
       .catch(() => undefined);
   }
@@ -215,12 +258,13 @@ export class DiscoveryFire {
     );
 
     const sessionKey = DiscoveryFire.deriveApplySessionKey(this.deps.projectKey, input.runId);
+    this.emitEvent(input.runId, "apply_started", { outcome: "executed" });
     this.deps.sessionOverrides.set(sessionKey, {
       cwd: projectRoot,
       permissionMode: "bypassPermissions",
       bypassAvailable: true,
       canPrompt: false,
-      excludeTools: ALWAYS_ON_EXCLUDED_TOOLS,
+      excludeTools: [...UNATTENDED_SESSION_EXCLUDED_TOOLS],
     });
 
     try {
@@ -244,6 +288,15 @@ export class DiscoveryFire {
         persistEvents: true,
       });
       const error = pickFirstError(events);
+      if (error) {
+        this.emitEvent(input.runId, "run_failed", {
+          outcome: "failed",
+          telemetryPhase: "apply",
+          error: { code: error.code ?? "apply_failed", message: error.message },
+        });
+      } else {
+        this.emitEvent(input.runId, "apply_completed", { outcome: "executed" });
+      }
       return {
         events,
         sessionKey,
@@ -301,17 +354,18 @@ export class DiscoveryFire {
     const state = await this.deps.stateStore.read(startedAt);
 
     // Phase 2: Workspace
+    this.emitEvent(runId, "workspace_started", { planId });
     let workspace: WorkspaceHandle;
     let workCycle: WorkCycleRecord;
     try {
-      const wsResult = await this.runWorkspacePhase({ runId, state });
+      const wsResult = await this.runWorkspacePhase({ runId, state, planTitle: planRecord.title });
       workspace = wsResult.handle;
       workCycle = wsResult.cycle;
     } catch (error) {
       const finishedAt = this.deps.now();
       const code = error instanceof AlwaysOnError ? error.code : "workspace_prepare_failed";
       const message = error instanceof Error ? error.message : String(error);
-      this.emitEvent(runId, "run_failed", { planId, error: { code, message }, outcome: "failed" });
+      this.emitEvent(runId, "run_failed", { planId, error: { code, message }, outcome: "failed", telemetryPhase: "workspace" });
       await this.deps.stateStore.markFireCompleted({ outcome: "failed", runId, planId, now: finishedAt });
       await this.deps.reportStore.appendHistory({ ...baseHistory, outcome: "failed", finishedAt: finishedAt.toISOString(), error: { code, message } });
       return { outcome: "failed", runId, startedAt: startedAt.toISOString(), finishedAt: finishedAt.toISOString(), planId, error: { code, message } };
@@ -319,6 +373,7 @@ export class DiscoveryFire {
 
     this.assertWorkspaceCwdSafe(workspace);
     workspace.metadata.startedAt = startedAt.toISOString();
+    this.emitEvent(runId, "workspace_ready", { planId });
 
     // Phase 3: Execution
     const executionSessionKey = DiscoveryFire.deriveExecutionSessionKey(this.deps.projectKey, runId);
@@ -327,7 +382,7 @@ export class DiscoveryFire {
       permissionMode: "bypassPermissions",
       bypassAvailable: true,
       canPrompt: false,
-      excludeTools: ALWAYS_ON_EXCLUDED_TOOLS,
+      excludeTools: [...UNATTENDED_SESSION_EXCLUDED_TOOLS],
       permissionRules: { deny: ALWAYS_ON_EXECUTION_DENY_RULES },
     });
 
@@ -369,7 +424,7 @@ export class DiscoveryFire {
     }
 
     if (executionError) {
-      this.emitEvent(runId, "run_failed", { planId, error: { code: executionError.code ?? "execution_failed", message: executionError.message }, outcome: "failed" });
+      this.emitEvent(runId, "run_failed", { planId, error: { code: executionError.code ?? "execution_failed", message: executionError.message }, outcome: "failed", telemetryPhase: "execution" });
       const finishedAt = this.deps.now();
       const reportFilePath = await this.writeFallbackReport({ runId, plan: planRecord, startedAt: startedAt.toISOString(), finishedAt: finishedAt.toISOString(), reason: `execution_failed: ${executionError.message}`, workspaceStrategy: workspace.strategy, workspaceHandle: workspace.cwd });
       await this.deps.planStore.updateStatus(planId, { status: "failed", reportFilePath, workCycleId: workCycle.id });
@@ -381,8 +436,9 @@ export class DiscoveryFire {
     this.emitEvent(runId, "execution_completed", { planId, title: planRecord.title });
 
     // Phase 4: Report
+    this.emitEvent(runId, "report_started", { planId, title: planRecord.title });
     const reportSessionKey = DiscoveryFire.deriveReportSessionKey(this.deps.projectKey, runId);
-    this.deps.sessionOverrides.set(reportSessionKey, { cwd: workspace.cwd, permissionMode: "bypassPermissions", bypassAvailable: true, canPrompt: false, excludeTools: ALWAYS_ON_EXCLUDED_TOOLS });
+    this.deps.sessionOverrides.set(reportSessionKey, { cwd: workspace.cwd, permissionMode: "bypassPermissions", bypassAvailable: true, canPrompt: false, excludeTools: [...UNATTENDED_SESSION_EXCLUDED_TOOLS] });
 
     const reportCtx: ReportRunContext = {
       kind: "report",
@@ -397,9 +453,10 @@ export class DiscoveryFire {
     };
     this.deps.runContexts.register(reportCtx);
 
+    let reportEvents: GatewayEvent[] = [];
     let reportError: { code?: string; message: string } | undefined;
     try {
-      const events = await this.drainTurn({
+      reportEvents = await this.drainTurn({
         sessionKey: reportSessionKey,
         channelKey: REPORT_CHANNEL,
         runId: `${runId}.report`,
@@ -407,7 +464,7 @@ export class DiscoveryFire {
         mode: "bypassPermissions",
         persistEvents: true,
       });
-      reportError = pickFirstError(events);
+      reportError = pickFirstError(reportEvents);
     } finally {
       this.deps.runContexts.unregister(reportSessionKey);
       this.deps.sessionOverrides.delete(reportSessionKey);
@@ -415,25 +472,44 @@ export class DiscoveryFire {
     }
 
     const finishedAt = this.deps.now();
-    const outcome: AlwaysOnDiscoveryOutcome = reportCtx.report && !reportError ? "executed" : "failed";
 
-    if (reportCtx.report && !reportError) {
-      this.emitEvent(runId, "report_produced", { planId, title: planRecord.title, outcome });
-      this.emitEvent(runId, "run_completed", { planId, title: planRecord.title, outcome });
-    } else {
-      this.emitEvent(runId, "run_failed", { planId, error: reportError ? { code: reportError.code ?? "report_failed", message: reportError.message } : { code: "report_tool_not_invoked", message: "Report tool was not invoked" }, outcome });
+    if (!reportCtx.report) {
+      const assistantText = extractAssistantText(reportEvents);
+      if (assistantText) {
+        const metadata: ReportMetadata = {
+          runId,
+          planId,
+          startedAt: startedAt.toISOString(),
+          finishedAt: finishedAt.toISOString(),
+          outcome: "executed",
+          workspaceStrategy: workspace.strategy === "git-worktree" ? "git-worktree" : "snapshot-copy",
+          workspaceHandle: workspace.cwd,
+        };
+        const parsed = parseReportMarkdown(assistantText, metadata);
+        const filePath = await this.deps.reportStore.writeReport(runId, parsed.rawContent);
+        reportCtx.report = { markdown: parsed.rawContent, filePath, finishedAt };
+      }
     }
+
+    const reportDegraded = !reportCtx.report || !!reportError;
+    const outcome: AlwaysOnDiscoveryOutcome = "executed";
+    const planStatus = reportDegraded ? "completed_no_report" as const : "completed" as const;
+
+    if (!reportDegraded) {
+      this.emitEvent(runId, "report_produced", { planId, title: planRecord.title, outcome });
+    }
+    this.emitEvent(runId, "run_completed", { planId, title: planRecord.title, outcome });
 
     let reportFilePath = reportCtx.report?.filePath;
     if (!reportCtx.report) {
       reportFilePath = await this.writeFallbackReport({ runId, plan: planRecord, startedAt: startedAt.toISOString(), finishedAt: finishedAt.toISOString(), reason: reportError ? `report_failed: ${reportError.message}` : "report_tool_not_invoked", workspaceStrategy: workspace.strategy, workspaceHandle: workspace.cwd });
     }
 
-    await this.deps.planStore.updateStatus(planId, { status: outcome === "executed" ? "completed" : "failed", reportFilePath, workCycleId: workCycle.id });
+    await this.deps.planStore.updateStatus(planId, { status: planStatus, reportFilePath, workCycleId: workCycle.id });
     await this.deps.stateStore.markFireCompleted({ outcome, runId, planId, now: finishedAt });
-    await this.deps.reportStore.appendHistory({ ...baseHistory, outcome, finishedAt: finishedAt.toISOString(), workCycleId: workCycle.id, workspace: { strategy: workspace.strategy, handle: workspace.cwd }, error: reportError ? { code: reportError.code ?? "report_failed", message: reportError.message } : undefined });
+    await this.deps.reportStore.appendHistory({ ...baseHistory, outcome, finishedAt: finishedAt.toISOString(), workCycleId: workCycle.id, workspace: { strategy: workspace.strategy, handle: workspace.cwd }, error: reportError ? { code: reportError.code ?? "report_degraded", message: reportError.message } : undefined });
 
-    return { outcome, runId, startedAt: startedAt.toISOString(), finishedAt: finishedAt.toISOString(), planId, workspace, reportFilePath, error: reportError ? { code: reportError.code ?? "report_failed", message: reportError.message } : undefined };
+    return { outcome, runId, startedAt: startedAt.toISOString(), finishedAt: finishedAt.toISOString(), planId, workspace, reportFilePath, error: reportError ? { code: reportError.code ?? "report_degraded", message: reportError.message } : undefined };
   }
 
   async run(input: DiscoveryFireRunInput): Promise<DiscoveryFireResult> {
@@ -477,7 +553,7 @@ export class DiscoveryFire {
       permissionMode: "bypassPermissions",
       bypassAvailable: true,
       canPrompt: false,
-      excludeTools: ALWAYS_ON_EXCLUDED_TOOLS,
+      excludeTools: [...UNATTENDED_SESSION_EXCLUDED_TOOLS],
     });
 
     const chatDigest = await buildChatDigest({
@@ -571,10 +647,11 @@ export class DiscoveryFire {
     this.emitEvent(runId, "plan_produced", { title: planRecord.title, planId: planRecord.id });
 
     // ── Phase 2: Workspace (bypassPermissions, agent-driven) ──
+    this.emitEvent(runId, "workspace_started", { planId: planRecord.id });
     let workspace: WorkspaceHandle;
     let workCycle: WorkCycleRecord;
     try {
-      const wsResult = await this.runWorkspacePhase({ runId, state });
+      const wsResult = await this.runWorkspacePhase({ runId, state, planTitle: planRecord.title });
       workspace = wsResult.handle;
       workCycle = wsResult.cycle;
     } catch (error) {
@@ -585,6 +662,7 @@ export class DiscoveryFire {
         planId: planRecord.id,
         error: { code, message },
         outcome: "failed",
+        telemetryPhase: "workspace",
       });
       await this.deps.stateStore.markFireCompleted({
         outcome: "failed",
@@ -620,7 +698,7 @@ export class DiscoveryFire {
       permissionMode: "bypassPermissions",
       bypassAvailable: true,
       canPrompt: false,
-      excludeTools: ALWAYS_ON_EXCLUDED_TOOLS,
+      excludeTools: [...UNATTENDED_SESSION_EXCLUDED_TOOLS],
       permissionRules: {
         deny: ALWAYS_ON_EXECUTION_DENY_RULES,
       },
@@ -673,6 +751,7 @@ export class DiscoveryFire {
         planId: planRecord.id,
         error: { code: executionError.code ?? "execution_failed", message: executionError.message },
         outcome: "failed",
+        telemetryPhase: "execution",
       });
       const finishedAt = this.deps.now();
       const reportFilePath = await this.writeFallbackReport({
@@ -714,13 +793,14 @@ export class DiscoveryFire {
     this.emitEvent(runId, "execution_completed", { planId: planRecord.id, title: planRecord.title });
 
     // ── Phase 4: Report (bypassPermissions, independent agent loop) ──
+    this.emitEvent(runId, "report_started", { planId: planRecord.id, title: planRecord.title });
     const reportSessionKey = DiscoveryFire.deriveReportSessionKey(this.deps.projectKey, runId);
     this.deps.sessionOverrides.set(reportSessionKey, {
       cwd: workspace.cwd,
       permissionMode: "bypassPermissions",
       bypassAvailable: true,
       canPrompt: false,
-      excludeTools: ALWAYS_ON_EXCLUDED_TOOLS,
+      excludeTools: [...UNATTENDED_SESSION_EXCLUDED_TOOLS],
     });
 
     const reportCtx: ReportRunContext = {
@@ -736,9 +816,10 @@ export class DiscoveryFire {
     };
     this.deps.runContexts.register(reportCtx);
 
+    let reportEvents: GatewayEvent[] = [];
     let reportError: { code?: string; message: string } | undefined;
     try {
-      const events = await this.drainTurn({
+      reportEvents = await this.drainTurn({
         sessionKey: reportSessionKey,
         channelKey: REPORT_CHANNEL,
         runId: `${runId}.report`,
@@ -752,7 +833,7 @@ export class DiscoveryFire {
         mode: "bypassPermissions",
         persistEvents: true,
       });
-      reportError = pickFirstError(events);
+      reportError = pickFirstError(reportEvents);
     } finally {
       this.deps.runContexts.unregister(reportSessionKey);
       this.deps.sessionOverrides.delete(reportSessionKey);
@@ -762,20 +843,33 @@ export class DiscoveryFire {
     }
 
     const finishedAt = this.deps.now();
-    const outcome: AlwaysOnDiscoveryOutcome = reportCtx.report && !reportError ? "executed" : "failed";
 
-    if (reportCtx.report && !reportError) {
-      this.emitEvent(runId, "report_produced", { planId: planRecord.id, title: planRecord.title, outcome });
-      this.emitEvent(runId, "run_completed", { planId: planRecord.id, title: planRecord.title, outcome });
-    } else {
-      this.emitEvent(runId, "run_failed", {
-        planId: planRecord.id,
-        error: reportError
-          ? { code: reportError.code ?? "report_failed", message: reportError.message }
-          : { code: "report_tool_not_invoked", message: "Report tool was not invoked" },
-        outcome,
-      });
+    if (!reportCtx.report) {
+      const assistantText = extractAssistantText(reportEvents);
+      if (assistantText) {
+        const metadata: ReportMetadata = {
+          runId,
+          planId: planRecord.id,
+          startedAt: startedAt.toISOString(),
+          finishedAt: finishedAt.toISOString(),
+          outcome: "executed",
+          workspaceStrategy: workspace.strategy === "git-worktree" ? "git-worktree" : "snapshot-copy",
+          workspaceHandle: workspace.cwd,
+        };
+        const parsed = parseReportMarkdown(assistantText, metadata);
+        const filePath = await this.deps.reportStore.writeReport(runId, parsed.rawContent);
+        reportCtx.report = { markdown: parsed.rawContent, filePath, finishedAt };
+      }
     }
+
+    const reportDegraded = !reportCtx.report || !!reportError;
+    const outcome: AlwaysOnDiscoveryOutcome = "executed";
+    const planStatus = reportDegraded ? "completed_no_report" as const : "completed" as const;
+
+    if (!reportDegraded) {
+      this.emitEvent(runId, "report_produced", { planId: planRecord.id, title: planRecord.title, outcome });
+    }
+    this.emitEvent(runId, "run_completed", { planId: planRecord.id, title: planRecord.title, outcome });
 
     let reportFilePath = reportCtx.report?.filePath;
     if (!reportCtx.report) {
@@ -793,7 +887,7 @@ export class DiscoveryFire {
     }
 
     await this.deps.planStore.updateStatus(planRecord.id, {
-      status: outcome === "executed" ? "completed" : "failed",
+      status: planStatus,
       reportFilePath,
       workCycleId: workCycle.id,
     });
@@ -810,7 +904,7 @@ export class DiscoveryFire {
       finishedAt: finishedAt.toISOString(),
       workCycleId: workCycle.id,
       workspace: { strategy: workspace.strategy, handle: workspace.cwd },
-      error: reportError ? { code: reportError.code ?? "report_failed", message: reportError.message } : undefined,
+      error: reportError ? { code: reportError.code ?? "report_degraded", message: reportError.message } : undefined,
     });
 
     return {
@@ -821,7 +915,7 @@ export class DiscoveryFire {
       planId: planRecord.id,
       workspace,
       reportFilePath,
-      error: reportError ? { code: reportError.code ?? "report_failed", message: reportError.message } : undefined,
+      error: reportError ? { code: reportError.code ?? "report_degraded", message: reportError.message } : undefined,
     };
   }
 
@@ -835,8 +929,9 @@ export class DiscoveryFire {
   private async runWorkspacePhase(input: {
     runId: string;
     state: AlwaysOnDiscoveryState;
+    planTitle: string;
   }): Promise<{ handle: WorkspaceHandle; cycle: WorkCycleRecord }> {
-    const { runId, state } = input;
+    const { runId, state, planTitle } = input;
 
     // ── Deterministic reuse check ──
     if (state.activeWorkCycleId) {
@@ -862,6 +957,7 @@ export class DiscoveryFire {
       kind: "workspace",
       sessionKey: workspaceSessionKey,
       runId,
+      planTitle,
       projectKey: this.deps.projectKey,
       paths: this.deps.paths,
       workspaceRegistry: this.deps.workspaceRegistry,
@@ -875,7 +971,7 @@ export class DiscoveryFire {
       permissionMode: "bypassPermissions",
       bypassAvailable: true,
       canPrompt: false,
-      excludeTools: ALWAYS_ON_EXCLUDED_TOOLS,
+      excludeTools: [...UNATTENDED_SESSION_EXCLUDED_TOOLS],
     });
 
     try {
@@ -886,6 +982,7 @@ export class DiscoveryFire {
         message: buildWorkspacePrompt({
           projectRoot: this.deps.projectKey,
           runId,
+          planTitle,
           language: this.deps.config.language,
         }),
         mode: "bypassPermissions",
@@ -914,6 +1011,7 @@ export class DiscoveryFire {
       state,
       projectKey: this.deps.projectKey,
       runId,
+      planTitle,
       cycleId,
       workspaceRegistry: this.deps.workspaceRegistry,
       stateStore: this.deps.stateStore,
@@ -957,6 +1055,13 @@ export class DiscoveryFire {
       mode: input.mode,
       runId: input.runId,
       projectKey: this.deps.projectKey,
+      telemetry: {
+        ownerModule: "always_on",
+        executionKind: "always_on",
+        phase: String(input.channelKey).startsWith("always-on/")
+          ? String(input.channelKey).slice("always-on/".length)
+          : undefined,
+      },
     })) {
       events.push(event);
       this.deps.onTurnEvent?.(input.sessionKey, input.channelKey, event);
@@ -1042,4 +1147,14 @@ function pickFirstError(events: GatewayEvent[]): { code?: string; message: strin
     }
   }
   return undefined;
+}
+
+function extractAssistantText(events: GatewayEvent[]): string {
+  let text = "";
+  for (const event of events) {
+    if (event.type === "assistant_text_delta") {
+      text += event.text;
+    }
+  }
+  return text.trim();
 }

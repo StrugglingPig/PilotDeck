@@ -1,5 +1,6 @@
+import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { createProjectId } from "../../pilot/paths.js";
+import { resolveProjectStorageId } from "../../pilot/paths.js";
 
 const ROOT_DIR_NAME = "always-on";
 
@@ -32,11 +33,13 @@ export function resolveAlwaysOnPaths(input: {
 }): AlwaysOnPaths {
   const pilotHome = resolve(input.pilotHome);
   const projectKey = resolve(input.projectKey);
-  const projectId = createProjectId(projectKey);
+  const projectId = resolveProjectStorageId(projectKey, pilotHome);
   const rootDir = resolve(pilotHome, ROOT_DIR_NAME);
   const projectDir = resolve(rootDir, "projects", projectId);
-  const worktreesDir = resolve(input.worktreesBaseDir ?? resolve(rootDir, "worktrees"), projectId);
-  const snapshotsDir = resolve(input.snapshotsBaseDir ?? resolve(rootDir, "snapshots"), projectId);
+  const worktreesBaseDir = resolveBaseDir(input.worktreesBaseDir, resolve(rootDir, "worktrees"));
+  const snapshotsBaseDir = resolveBaseDir(input.snapshotsBaseDir, resolve(rootDir, "snapshots"));
+  const worktreesDir = resolve(worktreesBaseDir, projectId);
+  const snapshotsDir = resolve(snapshotsBaseDir, projectId);
 
   return {
     pilotHome,
@@ -74,4 +77,17 @@ export function runEventsPath(paths: AlwaysOnPaths, runId: string): string {
 
 function sanitizeId(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unnamed";
+}
+
+function resolveBaseDir(value: string | undefined, fallback: string): string {
+  if (!value) {
+    return fallback;
+  }
+  if (value === "~") {
+    return homedir();
+  }
+  if (value.startsWith("~/") || value.startsWith("~\\")) {
+    return resolve(homedir(), value.slice(2));
+  }
+  return resolve(value);
 }

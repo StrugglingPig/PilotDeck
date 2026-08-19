@@ -45,6 +45,9 @@ export type PilotRawConfig = {
   alwaysOn?: unknown;
   cron?: unknown;
   tools?: unknown;
+  telemetry?: unknown;
+  proxy?: unknown;
+  webui?: unknown;
 };
 
 export type PilotExtensionConfig = {
@@ -67,7 +70,11 @@ export type PilotAgentConfig = {
    * or when you want compaction to kick in earlier.
    */
   maxContextTokens?: number;
+  /** Override the selected model catalog's output-token cap. */
+  maxOutputTokens?: number;
+  thinking?: { enabled: boolean; budgetTokens?: number };
   subagents?: {
+    default?: PilotAgentModelSelection;
     timeoutMs?: number;
   };
 };
@@ -79,7 +86,12 @@ export type PilotAgentConfig = {
  */
 export type PilotRouterConfig = RouterConfig;
 
-export type PilotMemoryApiType = "openai-responses" | "responses" | "openai-completions";
+export type PilotMemoryApiType =
+  | "openai-responses"
+  | "responses"
+  | "openai-completions"
+  | "anthropic"
+  | "google";
 export type PilotMemoryReasoningMode = "answer_first" | "accuracy_first";
 
 export type PilotMemoryScheduleConfig = {
@@ -107,6 +119,8 @@ export type PilotGatewayConfig = {
   port: number;
   bindAddress: "127.0.0.1";
   idleSessionTimeoutMinutes: number;
+  idleSweepIntervalSeconds: number;
+  memoryDiagnostics: boolean;
   staticAssetsPath?: string;
   /**
    * Maximum number of concurrent per-session MCP instances (e.g. browser-use
@@ -139,6 +153,8 @@ export type PilotWebSearchCustomProviderConfig = {
  * runtime; `apiKey` and `endpoint` apply to the selected provider.
  */
 export type PilotWebSearchConfig = {
+  /** Defaults to true when omitted. False removes web_search from the tool registry. */
+  enabled?: boolean;
   provider?: PilotWebSearchProvider;
   apiKey?: string;
   endpoint?: string;
@@ -147,6 +163,11 @@ export type PilotWebSearchConfig = {
 
 export type PilotToolsConfig = {
   webSearch?: PilotWebSearchConfig;
+};
+
+export type PilotProxyConfig = {
+  url: string;
+  noProxy?: string;
 };
 
 export type PilotPlatformAdapterConfig = {
@@ -175,6 +196,14 @@ export type PilotAdaptersConfig = {
     domainName?: "feishu" | "lark";
   };
   weixin?: { enabled: boolean };
+  qq?: {
+    enabled: boolean;
+    appId?: string;
+    clientSecret?: string;
+    allowGroups?: string[];
+    triggerPrefixes?: string[];
+    maxMessageLength?: number;
+  };
   telegram?: PilotPlatformAdapterConfig;
   discord?: PilotPlatformAdapterConfig;
   slack?: PilotPlatformAdapterConfig;
@@ -193,6 +222,10 @@ export type PilotAdaptersConfig = {
   webhook?: PilotPlatformAdapterConfig;
 };
 
+export type PilotTelemetryConfig = {
+  enabled: boolean;
+};
+
 export type PilotConfig = {
   agent: PilotAgentConfig;
   model: ModelConfig;
@@ -204,6 +237,8 @@ export type PilotConfig = {
   alwaysOn?: AlwaysOnConfig;
   cron?: CronConfig;
   tools?: PilotToolsConfig;
+  telemetry?: PilotTelemetryConfig;
+  proxy?: PilotProxyConfig;
 };
 
 export type PilotConfigSnapshot = {

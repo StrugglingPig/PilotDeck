@@ -1,13 +1,21 @@
 /**
  * Pure-JS port of `src/cli/proxy.ts` — installs a global undici
- * ProxyAgent so Node native `fetch()` honors `PILOTDECK_PROXY` /
- * `HTTPS_PROXY` / `HTTP_PROXY`. Node's native fetch does NOT respect
- * those env vars by default; this closes the gap.
+ * proxy agent so Node native `fetch()` and `WebSocket` honor
+ * `PILOTDECK_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`. Node's native
+ * fetch does NOT respect those env vars by default; this closes the
+ * gap.
+ *
+ * Uses `EnvHttpProxyAgent` instead of bare `ProxyAgent` so that
+ * `NO_PROXY` / `no_proxy` is honored. `127.0.0.1` and `localhost`
+ * are always excluded — the gateway WebSocket lives on loopback and
+ * must never be routed through an external proxy.
  *
  * Living in `ui/server/utils/` lets the express bridge run from
  * source without depending on `dist/src/cli/proxy.js`.
  */
-import { ProxyAgent, setGlobalDispatcher } from 'undici';
+import { Agent, EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
+
+export const UNDICI_TRANSPORT_TIMEOUT_MS = 600_000;
 
 function getProxyUrl(env = process.env) {
     return (
@@ -19,25 +27,78 @@ function getProxyUrl(env = process.env) {
     );
 }
 
-let installed = false;
+let dispatcherState;
 
 /**
- * Install a global undici ProxyAgent. Safe to call multiple times —
- * only the first effective call wins. Returns the proxy URL that was
- * activated, or undefined if no proxy is configured.
+ * Install a global undici dispatcher. Env proxy settings keep precedence over
+ * the first config-based proxy install during startup.
  *
  * @param {string} [explicitUrl] Override the env-driven proxy URL.
  * @returns {string | undefined} The activated proxy URL.
  */
-export function installGlobalProxy(explicitUrl) {
-    if (installed) return undefined;
+export function installGlobalProxy(explicitUrl, extraNoProxy) {
     const proxyUrl = explicitUrl ?? getProxyUrl();
-    if (!proxyUrl) return undefined;
+    if (!proxyUrl) {
+        applyDirectDispatcher();
+        return undefined;
+    }
+
+    const source = explicitUrl ? 'config' : 'env';
+    if (
+        source === 'config'
+        && dispatcherState?.mode === 'proxy'
+        && dispatcherState.source === 'env'
+    ) {
+        return undefined;
+    }
+
+    if (
+        dispatcherState?.mode === 'proxy'
+        && dispatcherState.source === source
+        && dispatcherState.proxyUrl === proxyUrl
+    ) {
+        return undefined;
+    }
+
+    return applyGlobalProxy(proxyUrl, source, extraNoProxy);
+}
+
+export function getGlobalProxyStateForTesting() {
+    return dispatcherState ? { ...dispatcherState } : undefined;
+}
+
+export function reinstallGlobalProxy(proxyUrl, extraNoProxy) {
+    if (!proxyUrl) {
+        applyDirectDispatcher(true);
+        return undefined;
+    }
+    return applyGlobalProxy(proxyUrl, 'config', extraNoProxy);
+}
+
+function applyDirectDispatcher(logRemoval = false) {
     try {
-        const agent = new ProxyAgent(proxyUrl);
+        setGlobalDispatcher(new Agent(createLongTimeoutOptions()));
+        dispatcherState = { mode: 'direct' };
+        if (logRemoval) {
+            console.log('[proxy] Global fetch proxy removed');
+        }
+    } catch {
+        // best effort
+    }
+}
+
+function applyGlobalProxy(proxyUrl, source, extraNoProxy) {
+    try {
+        const noProxy = buildNoProxy(extraNoProxy);
+        const agent = new EnvHttpProxyAgent({
+            httpProxy: proxyUrl,
+            httpsProxy: proxyUrl,
+            noProxy,
+            ...createLongTimeoutOptions(),
+        });
         setGlobalDispatcher(agent);
-        installed = true;
-        console.log(`[proxy] Global fetch proxy → ${proxyUrl}`);
+        dispatcherState = { mode: 'proxy', source, proxyUrl, noProxy };
+        console.log(`[proxy] Global fetch proxy → ${proxyUrl} (noProxy: ${noProxy})`);
         return proxyUrl;
     } catch (error) {
         console.warn(
@@ -46,4 +107,18 @@ export function installGlobalProxy(explicitUrl) {
         );
         return undefined;
     }
+}
+
+function createLongTimeoutOptions() {
+    return {
+        headersTimeout: UNDICI_TRANSPORT_TIMEOUT_MS,
+        bodyTimeout: UNDICI_TRANSPORT_TIMEOUT_MS,
+    };
+}
+
+function buildNoProxy(extraNoProxy) {
+    const userNoProxy = process.env.no_proxy || process.env.NO_PROXY || '';
+    return [userNoProxy, extraNoProxy, '127.0.0.1', 'localhost']
+        .filter(Boolean)
+        .join(',');
 }

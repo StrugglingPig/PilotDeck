@@ -4,16 +4,37 @@ import {
   type CanonicalMessage,
 } from "../../model/index.js";
 import { countTokens } from "./tokenizer.js";
+import { effectiveInputContextTokens } from "./effectiveContext.js";
 
 export type TokenWarningState = "ok" | "warning" | "blocking";
 
 export type TokenBudgetSnapshot = {
   tokens: number;
+  /** Local tokenizer estimate retained for diagnostics, never UI display. */
+  localEstimateTokens?: number;
+  displayTokens?: number;
+  estimateSource?: "estimator" | "usage";
+  usageTokens?: number;
+  calibrationActualInputTokens?: number;
+  calibrationEstimatedInputTokens?: number;
+  /** Original provider/model context window before subtracting output reserve. */
+  totalContextTokens?: number;
+  /** Prompt/input budget after subtracting any explicit output reserve. */
   maxContextTokens: number;
+  effectiveContextTokens?: number;
+  maxOutputTokens?: number;
   warningRatio: number;
   blockingRatio: number;
   state: TokenWarningState;
   ratio: number;
+  source?: "provider" | "calibrated" | "local";
+  exact?: boolean;
+  reservedOutputTokens?: number;
+  estimatorError?: string;
+};
+
+export type TokenBudgetEvaluateOptions = {
+  reservedOutputTokens?: number;
 };
 
 export type TokenBudgetManagerOptions = {
@@ -21,7 +42,7 @@ export type TokenBudgetManagerOptions = {
   multimediaTokens?: number;
   /** Auto-compact / warning threshold (default 0.8). */
   warningRatio?: number;
-  /** Hard blocking threshold (default 0.95). */
+  /** Hard blocking threshold (default 0.90). */
   blockingRatio?: number;
   /** Per-message overhead for role/wrapper boilerplate (default 4 tokens). */
   perMessageOverhead?: number;
@@ -33,16 +54,8 @@ export type TokenBudgetManagerOptions = {
  */
 export const IMAGE_MAX_TOKEN_SIZE = 2_000;
 const DEFAULT_WARNING_RATIO = 0.8;
-const DEFAULT_BLOCKING_RATIO = 0.95;
+const DEFAULT_BLOCKING_RATIO = 0.90;
 const DEFAULT_PER_MESSAGE_OVERHEAD = 4;
-
-/**
- * Padding factor applied by `estimateForMessagesWithPadding`. Multiplies
- * by 4/3 to reserve headroom for drift between our tiktoken estimator
- * and the provider's actual tokenizer.
- */
-const ROUGH_PADDING_NUMERATOR = 4;
-const ROUGH_PADDING_DENOMINATOR = 3;
 
 /**
  * Token budget estimator backed by o200k_base tiktoken encoding.
@@ -94,8 +107,11 @@ export class TokenBudgetManager {
         // T1 leaf application.
         return this.estimateTextTokens(block.text);
       case "thinking":
-        // T5: text only; signature is provider-opaque metadata.
-        return this.estimateTextTokens(block.text);
+        // T5: count the provider-native replay payload when present. For
+        // OpenAI-compatible providers, `reasoningContent` is what enters the
+        // next request as `reasoning_content`; `text` is only the legacy
+        // fallback. Signature remains provider-opaque metadata.
+        return this.estimateTextTokens(block.reasoningContent ?? block.text);
       case "image":
         // T6.
         return this.multimediaTokens;
@@ -117,7 +133,11 @@ export class TokenBudgetManager {
       case "tool_result_reference":
         // T13: PilotDeck-only block; preview only.
         return this.estimateTextTokens(block.preview);
+      case "media_reference":
+        // Media references materialize back to media blocks before provider requests.
+        return this.multimediaTokens;
     }
+    return 0;
   }
 
   /** T11: per-message estimate including overhead. */
@@ -146,20 +166,38 @@ export class TokenBudgetManager {
     return this.estimateForMessages(messages);
   }
 
-  /**
-   * T12: padded estimate (4/3 multiplier, ceil) used by warning / compaction
-   * gates. Conservative upper bound that survives drift between our
-   * estimator and the provider's tokenizer.
-   */
-  estimateForMessagesWithPadding(messages: CanonicalMessage[]): number {
-    const raw = this.estimateForMessages(messages);
-    if (raw === 0) return 0;
-    return Math.ceil((raw * ROUGH_PADDING_NUMERATOR) / ROUGH_PADDING_DENOMINATOR);
+  evaluate(
+    messages: CanonicalMessage[],
+    maxContextTokens: number,
+    optionsOrMaxOutputTokens: TokenBudgetEvaluateOptions | number = {},
+  ): TokenBudgetSnapshot {
+    const options = typeof optionsOrMaxOutputTokens === "number"
+      ? { reservedOutputTokens: optionsOrMaxOutputTokens }
+      : optionsOrMaxOutputTokens;
+    return this.snapshotFromTokens(this.estimateMessagesTokens(messages), maxContextTokens, {
+      reservedOutputTokens: options.reservedOutputTokens,
+    });
   }
 
-  evaluate(messages: CanonicalMessage[], maxContextTokens: number): TokenBudgetSnapshot {
-    const tokens = this.estimateMessagesTokens(messages);
-    const ratio = maxContextTokens > 0 ? tokens / maxContextTokens : 0;
+  snapshotFromTokens(
+    tokens: number,
+    maxContextTokens: number,
+    options: {
+      reservedOutputTokens?: number;
+      source?: "provider" | "calibrated" | "local";
+      exact?: boolean;
+      estimatorError?: string;
+      usageTokens?: number;
+      localEstimateTokens?: number;
+      displayTokens?: number;
+      calibrationActualInputTokens?: number;
+      calibrationEstimatedInputTokens?: number;
+    } = {},
+  ): TokenBudgetSnapshot {
+    const reserved = Math.max(0, Math.floor(options.reservedOutputTokens ?? 0));
+    const totalContextTokens = Math.max(1, Math.floor(maxContextTokens));
+    const promptBudget = effectiveInputContextTokens(maxContextTokens, reserved);
+    const ratio = promptBudget > 0 ? tokens / promptBudget : 0;
     let state: TokenWarningState = "ok";
     if (ratio >= this.blockingRatio) {
       state = "blocking";
@@ -168,11 +206,28 @@ export class TokenBudgetManager {
     }
     return {
       tokens,
-      maxContextTokens,
+      ...(options.localEstimateTokens !== undefined ? { localEstimateTokens: options.localEstimateTokens } : {}),
+      ...(options.displayTokens !== undefined && options.displayTokens !== tokens ? { displayTokens: options.displayTokens } : {}),
+      estimateSource: options.usageTokens !== undefined ? "usage" : "estimator",
+      ...(options.usageTokens !== undefined ? { usageTokens: options.usageTokens } : {}),
+      ...(options.calibrationActualInputTokens !== undefined
+        ? { calibrationActualInputTokens: options.calibrationActualInputTokens }
+        : {}),
+      ...(options.calibrationEstimatedInputTokens !== undefined
+        ? { calibrationEstimatedInputTokens: options.calibrationEstimatedInputTokens }
+        : {}),
+      totalContextTokens,
+      maxContextTokens: promptBudget,
+      effectiveContextTokens: promptBudget,
+      maxOutputTokens: reserved,
       warningRatio: this.warningRatio,
       blockingRatio: this.blockingRatio,
       state,
       ratio,
+      source: options.source,
+      exact: options.exact,
+      reservedOutputTokens: reserved,
+      estimatorError: options.estimatorError,
     };
   }
 }

@@ -90,3 +90,13 @@ export type {
   ChannelMessage,
   ChannelStartDeps,
 } from "./channel/protocol/ChannelAdapter.js";
+
+export {
+  executeChannelCommand,
+  resolveCommand,
+  getRegisteredCommands,
+  type ChannelCommand,
+  type CommandExecContext,
+} from "./channel/protocol/ChannelAdapter.js";
+
+export { ChannelStatePersistence, type ChannelStatePersistenceOptions } from "./channel/protocol/ChannelStatePersistence.js";

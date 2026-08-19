@@ -1,16 +1,12 @@
-import {
-  ANTHROPIC_DEFAULT_CAPABILITIES,
-  ANTHROPIC_DEFAULT_MULTIMODAL,
-} from "../providers/anthropic/defaults.js";
-import {
-  OPENAI_DEFAULT_CAPABILITIES,
-  OPENAI_DEFAULT_MULTIMODAL,
-} from "../providers/openai/defaults.js";
+import { ANTHROPIC_DEFAULT_CAPABILITIES } from "../providers/anthropic/defaults.js";
+import { OPENAI_DEFAULT_CAPABILITIES } from "../providers/openai/defaults.js";
+import { GOOGLE_DEFAULT_CAPABILITIES } from "../providers/google/defaults.js";
 import type {
   ModelConfig,
   ModelDefinition,
   ModelProtocol,
   ProviderConfig,
+  ProviderRetryConfig,
 } from "../protocol/canonical.js";
 import { mergeCapabilities, type ModelCapabilities } from "../protocol/capabilities.js";
 import { ModelConfigError } from "../protocol/errors.js";
@@ -76,7 +72,9 @@ function parseProvider(providerId: string, rawProvider: unknown, env?: Credentia
   }
 
   const trimmedUrl = typeof provider.url === "string" ? provider.url.trim() : "";
-  const rawUrl = trimmedUrl.length > 0 ? trimmedUrl : catalogProvider?.defaultUrl;
+  const rawUrl = trimmedUrl.length > 0
+    ? trimmedUrl
+    : resolveDefaultProviderUrl(providerId, protocol, catalogProvider?.defaultUrl);
   if (!rawUrl) {
     throw new ModelConfigError("invalid_config_value", `Provider ${providerId} requires a url.`, { providerId });
   }
@@ -97,13 +95,62 @@ function parseProvider(providerId: string, rawProvider: unknown, env?: Credentia
     id: providerId,
     protocol,
     url: rawUrl,
-    apiKey: resolveApiKey(provider.apiKey, env),
+    apiKey: resolveProviderApiKey(providerId, provider.apiKey, env, catalogProvider?.apiKeyEnvVar),
     timeoutMs: readOptionalPositiveNumber(provider.timeoutMs, "timeoutMs"),
     headers: readStringRecord(provider.headers, "headers"),
     extraBody: isRecord(provider.extraBody) ? (provider.extraBody as Record<string, unknown>) : undefined,
-    retry: isRecord(provider.retry) ? provider.retry : undefined,
+    retry: parseRetryConfig(provider.retry),
     models,
   };
+}
+
+function resolveProviderApiKey(
+  providerId: string,
+  value: unknown,
+  env?: CredentialEnv,
+  catalogEnvVar?: string,
+): string {
+  if (providerId === "ollama" && value === undefined) {
+    return "ollama";
+  }
+  const hasBlankString = typeof value === "string" && value.trim().length === 0;
+  const hasConfigValue = value !== undefined && value !== null && !hasBlankString;
+  const effectiveValue = hasConfigValue
+    ? value
+    : catalogEnvVar ? `\${${catalogEnvVar}}` : value;
+  return resolveApiKey(effectiveValue, env);
+}
+
+function resolveDefaultProviderUrl(
+  providerId: string,
+  protocol: ModelProtocol,
+  catalogDefaultUrl: string | undefined,
+): string | undefined {
+  if (providerId === "google" && protocol === "openai") {
+    return "https://generativelanguage.googleapis.com/v1beta/openai";
+  }
+  return catalogDefaultUrl;
+}
+
+function parseRetryConfig(raw: unknown): ProviderRetryConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw)) return undefined;
+  const result: ProviderRetryConfig = {};
+  const numFields = [
+    "requestMaxRetries", "streamMaxRetries", "streamIdleTimeoutMs",
+    "maxStreamingDurationMs", "repeatedChunkLimit",
+    "baseDelayMs", "maxDelayMs", "jitter",
+  ] as const;
+  for (const key of numFields) {
+    const value = raw[key];
+    if (value !== undefined) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+        throw new ModelConfigError("invalid_config_value", `retry.${key} must be a non-negative number.`);
+      }
+      result[key] = value;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function parseModelDefinition(
@@ -122,7 +169,13 @@ function parseModelDefinition(
   const catalogModel = catalogHit.model;
 
   const capabilities = parseCapabilities(protocol, model.capabilities, catalogModel?.capabilities);
-  const multimodal = parseMultimodal(protocol, model.multimodal, catalogModel?.multimodal);
+  // Cross-provider model-name matches are useful for token/capability hints,
+  // but they must not silently opt a custom model into image delivery. Aliases
+  // declared by the selected catalog provider are trusted like exact matches.
+  const catalogMultimodal = catalogHit.matchType === "exact" || catalogHit.matchType === "alias"
+    ? catalogModel?.multimodal
+    : undefined;
+  const multimodal = parseMultimodal(model.multimodal, catalogMultimodal);
 
   return {
     id: modelId,
@@ -141,7 +194,11 @@ function parseCapabilities(
   catalogCapabilities?: ModelCapabilities,
 ): ModelCapabilities {
   const protocolDefaults =
-    protocol === "anthropic" ? ANTHROPIC_DEFAULT_CAPABILITIES : OPENAI_DEFAULT_CAPABILITIES;
+    protocol === "anthropic"
+      ? ANTHROPIC_DEFAULT_CAPABILITIES
+      : protocol === "google"
+        ? GOOGLE_DEFAULT_CAPABILITIES
+        : OPENAI_DEFAULT_CAPABILITIES;
   const defaults = catalogCapabilities ?? protocolDefaults;
 
   if (rawCapabilities === undefined) {
@@ -185,17 +242,22 @@ function parseCapabilities(
     }
   }
 
-  return mergeCapabilities(defaults, overrides);
+  return {
+    ...mergeCapabilities(defaults, overrides),
+    ...(capabilities.supportsThinking !== undefined
+      ? { supportsThinkingExplicit: capabilities.supportsThinking }
+      : {}),
+  } as ModelCapabilities;
 }
 
 function parseMultimodal(
-  protocol: ModelProtocol,
   rawMultimodal: unknown,
   catalogMultimodal?: MultimodalConstraints,
 ): MultimodalConstraints {
-  const protocolDefaults =
-    protocol === "anthropic" ? ANTHROPIC_DEFAULT_MULTIMODAL : OPENAI_DEFAULT_MULTIMODAL;
-  const defaults = catalogMultimodal ?? { ...DEFAULT_MULTIMODAL_CONSTRAINTS, ...protocolDefaults };
+  // Unknown/custom models are text-only until their model definition explicitly
+  // opts into additional modalities. Protocol compatibility alone does not imply
+  // that the upstream model accepts images.
+  const defaults = catalogMultimodal ?? DEFAULT_MULTIMODAL_CONSTRAINTS;
 
   if (rawMultimodal === undefined) {
     return defaults;

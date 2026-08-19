@@ -2096,8 +2096,89 @@ function extractResponsesText(payload: unknown): string {
   return text;
 }
 
+function extractAnthropicMessagesText(payload: unknown): string {
+  if (!isRecord(payload) || !Array.isArray(payload.content)) {
+    throw new Error("Invalid Anthropic messages payload");
+  }
+  const text = payload.content
+    .map((part) => (isRecord(part) && typeof part.text === "string" ? part.text : ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  if (!text) throw new Error("Anthropic messages payload did not contain text");
+  return text;
+}
+
+function extractGoogleGenerateContentText(payload: unknown): string {
+  if (!isRecord(payload) || !Array.isArray(payload.candidates)) {
+    throw new Error("Invalid Google generateContent payload");
+  }
+  const chunks: string[] = [];
+  for (const candidate of payload.candidates) {
+    if (!isRecord(candidate) || !isRecord(candidate.content) || !Array.isArray(candidate.content.parts)) continue;
+    for (const part of candidate.content.parts) {
+      if (isRecord(part) && typeof part.text === "string") chunks.push(part.text);
+    }
+  }
+  const text = chunks.join("\n").trim();
+  if (!text) throw new Error("Google generateContent payload did not contain text");
+  return text;
+}
+
+function normalizeProviderApi(value: string): string {
+  const api = value.trim().toLowerCase();
+  return api === "gemini" ? "google" : api;
+}
+
+function buildGoogleGenerateContentUrl(baseUrl: string, model: string): string {
+  const url = new URL(stripTrailingSlash(baseUrl));
+  const parts = url.pathname.split("/").filter(Boolean);
+  const last = parts.at(-1);
+  const apiVersion = last === "v1" || last === "v1beta" ? last : "v1beta";
+  const baseParts = last === "v1" || last === "v1beta" ? parts.slice(0, -1) : parts;
+  url.pathname = `/${[
+    ...baseParts,
+    apiVersion,
+    "models",
+    `${encodeURIComponent(normalizeGoogleModelId(model))}:generateContent`,
+  ].join("/")}`;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function normalizeGoogleModelId(model: string): string {
+  const withoutProvider = model.trim().startsWith("google/") ? model.trim().slice("google/".length) : model.trim();
+  if (withoutProvider === "gemini-3-pro") return "gemini-3-pro-preview";
+  if (withoutProvider === "gemini-3.1-pro") return "gemini-3.1-pro-preview";
+  if (withoutProvider === "gemini-3-flash") return "gemini-3-flash-preview";
+  if (withoutProvider === "gemini-3.1-flash" || withoutProvider === "gemini-3.1-flash-preview") {
+    return "gemini-3-flash-preview";
+  }
+  if (withoutProvider === "gemini-3.1-flash-lite") return "gemini-3.1-flash-lite-preview";
+  return withoutProvider;
+}
+
 function looksLikeEnvVarName(value: string): boolean {
   return /^[A-Z0-9_]+$/.test(value);
+}
+
+type MemoryTelemetryLike = {
+  trackFeatureLoopStage?: (input: Record<string, unknown>) => void;
+  trackError?: (error: unknown, input?: Record<string, unknown>) => void;
+};
+
+function resolveMemoryTelemetry(runtime: Record<string, unknown> | undefined): MemoryTelemetryLike | undefined {
+  const telemetry = runtime?.telemetry;
+  return typeof telemetry === "object" && telemetry !== null ? telemetry as MemoryTelemetryLike : undefined;
+}
+
+function memoryPhaseFromLabel(label: string): "retrieve" | "capture" | "index" | "dream" {
+  const normalized = label.toLowerCase();
+  if (normalized.includes("retrieve") || normalized.includes("retrieval") || normalized.includes("recall")) return "retrieve";
+  if (normalized.includes("dream") || normalized.includes("rewrite")) return "dream";
+  if (normalized.includes("capture") || normalized.includes("extract")) return "capture";
+  return "index";
 }
 
 export class LlmMemoryExtractor {
@@ -2188,15 +2269,30 @@ export class LlmMemoryExtractor {
     if (!selection.baseUrl) {
       throw new Error(`${input.requestLabel} provider "${selection.provider}" does not have a baseUrl`);
     }
+    const telemetry = resolveMemoryTelemetry(this.runtime);
+    telemetry?.trackFeatureLoopStage?.({
+      module: "memory",
+      ownerModule: "memory",
+      executionKind: "memory",
+      phase: memoryPhaseFromLabel(input.requestLabel),
+      loopStage: "model_request",
+      outcome: "success",
+      metadata: {
+        provider: selection.provider,
+        model: selection.model,
+        providerBaseUrl: selection.baseUrl,
+        requestLabel: input.requestLabel,
+      },
+    });
     const apiKey = await this.resolveApiKey(selection.provider);
     const headers = new Headers(selection.headers);
     if (!headers.has("content-type")) headers.set("content-type", "application/json");
-    if (!headers.has("authorization")) headers.set("authorization", `Bearer ${apiKey}`);
-    const apiType = selection.api.trim().toLowerCase();
+    const apiType = normalizeProviderApi(selection.api);
     let url = "";
     let body: Record<string, unknown>;
 
     if (apiType === "openai-responses" || apiType === "responses") {
+      if (!headers.has("authorization")) headers.set("authorization", `Bearer ${apiKey}`);
       url = `${selection.baseUrl}/responses`;
       body = {
         model: selection.model,
@@ -2206,7 +2302,34 @@ export class LlmMemoryExtractor {
           { role: "user", content: input.userPrompt },
         ],
       };
+    } else if (apiType === "anthropic") {
+      if (!headers.has("x-api-key")) headers.set("x-api-key", apiKey);
+      if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01");
+      url = `${selection.baseUrl}/v1/messages`;
+      body = {
+        model: selection.model,
+        max_tokens: 32768,
+        temperature: 0,
+        system: input.systemPrompt,
+        messages: [
+          { role: "user", content: input.userPrompt },
+        ],
+      };
+    } else if (apiType === "google") {
+      if (!headers.has("x-goog-api-key")) headers.set("x-goog-api-key", apiKey);
+      url = buildGoogleGenerateContentUrl(selection.baseUrl, selection.model);
+      body = {
+        systemInstruction: { parts: [{ text: input.systemPrompt }] },
+        contents: [
+          { role: "user", parts: [{ text: input.userPrompt }] },
+        ],
+        generationConfig: {
+          temperature: 0,
+          responseMimeType: "application/json",
+        },
+      };
     } else {
+      if (!headers.has("authorization")) headers.set("authorization", `Bearer ${apiKey}`);
       url = `${selection.baseUrl}/chat/completions`;
       body = {
         model: selection.model,
@@ -2271,16 +2394,63 @@ export class LlmMemoryExtractor {
     try {
       response = await executeWithRetry(body);
     } catch (error) {
-      if (!("response_format" in body)) throw error;
+      if (!("response_format" in body)) {
+        telemetry?.trackError?.(error, {
+          module: "memory",
+          ownerModule: "memory",
+          executionKind: "memory",
+          phase: memoryPhaseFromLabel(input.requestLabel),
+          loopStage: "model_request",
+          errorCategory: "model_request_error",
+          metadata: {
+            provider: selection.provider,
+            model: selection.model,
+            providerBaseUrl: selection.baseUrl,
+          },
+        });
+        throw error;
+      }
       const fallbackBody = { ...body };
       delete fallbackBody.response_format;
-      response = await executeWithRetry(fallbackBody);
+      try {
+        response = await executeWithRetry(fallbackBody);
+      } catch (fallbackError) {
+        telemetry?.trackError?.(fallbackError, {
+          module: "memory",
+          ownerModule: "memory",
+          executionKind: "memory",
+          phase: memoryPhaseFromLabel(input.requestLabel),
+          loopStage: "model_request",
+          errorCategory: "model_request_error",
+          metadata: {
+            provider: selection.provider,
+            model: selection.model,
+            providerBaseUrl: selection.baseUrl,
+          },
+        });
+        throw fallbackError;
+      }
     }
 
     const payload = await response.json();
-    return apiType === "openai-responses" || apiType === "responses"
-      ? extractResponsesText(payload)
-      : extractChatCompletionsText(payload);
+    telemetry?.trackFeatureLoopStage?.({
+      module: "memory",
+      ownerModule: "memory",
+      executionKind: "memory",
+      phase: memoryPhaseFromLabel(input.requestLabel),
+      loopStage: "model_response",
+      outcome: "success",
+      metadata: {
+        provider: selection.provider,
+        model: selection.model,
+        providerBaseUrl: selection.baseUrl,
+        requestLabel: input.requestLabel,
+      },
+    });
+    if (apiType === "openai-responses" || apiType === "responses") return extractResponsesText(payload);
+    if (apiType === "anthropic") return extractAnthropicMessagesText(payload);
+    if (apiType === "google") return extractGoogleGenerateContentText(payload);
+    return extractChatCompletionsText(payload);
   }
 
   private async callStructuredJsonWithDebug<T>(input: {

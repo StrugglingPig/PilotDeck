@@ -3,8 +3,16 @@ export {
   SessionRouter,
   type GatewaySessionContext,
   type GatewaySessionFactory,
+  type SessionEvictionSnapshot,
   type SessionRouterOptions,
 } from "./SessionRouter.js";
+export {
+  isGatewayMemoryDiagnosticsEnabled,
+  logGatewayMemoryDiagnostic,
+  summarizeCanonicalMessages,
+  type GatewayMemoryDiagnosticInput,
+  type GatewayMemoryDiagnosticSession,
+} from "./memoryDiagnostics.js";
 export { InProcessGateway, mapAgentEvent, type InProcessGatewayOptions } from "./client/InProcessGateway.js";
 export { GatewayWsClient, GatewayRequestError, type GatewayWsClientOptions } from "./client/GatewayWsClient.js";
 export { RemoteGateway, createRemoteGateway } from "./client/RemoteGateway.js";
@@ -18,6 +26,7 @@ export {
 } from "./server/authToken.js";
 export type {
   ChannelAttachment,
+  GatewayOutboundAttachment,
   Gateway,
   GatewayActiveTurnSnapshot,
   GatewayActiveTurnSnapshotInput,
@@ -27,12 +36,30 @@ export type {
   GatewayError,
   GatewayEvent,
   GatewayMode,
+  GatewayCapability,
   GatewayServerInfo,
   GatewaySessionInfo,
   GatewaySubmitTurnInput,
+  MatchRange,
+  ProjectFileEntry,
+  ProjectFilesListInput,
+  ProjectFilesListResult,
+  CommandListItem,
+  CommandsListInput,
+  CommandsListResult,
+  ModelCatalogItem,
+  ModelCatalogListInput,
+  ModelCatalogListResult,
+  ExplicitModelSelection,
+  SessionModelSelection,
+  SessionModelInput,
+  SessionModelSetInput,
+  SessionModelResult,
+  UploadedAttachmentRef,
   ListSessionsInput,
   ListSessionsResult,
   NewSessionInput,
+  PrepareWeixinLoginResult,
   ReloadConfigResult,
   TurnUsage,
 } from "./protocol/index.js";

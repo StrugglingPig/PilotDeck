@@ -1,5 +1,9 @@
 import type { Gateway, GatewayChannelKey } from "../../../gateway/index.js";
+import type { CronResultDelivery } from "../../../cron/index.js";
 import type { ChannelAdapter, ChannelHandle, ChannelLogger, ChannelStartDeps } from "../protocol/ChannelAdapter.js";
+import { deliverChatCronResult } from "../protocol/ImCronDelivery.js";
+import { ImElicitationHelper } from "../protocol/ImElicitationHelper.js";
+import { ImPermissionHelper } from "../protocol/ImPermissionHelper.js";
 import { DiscordSessionMapper } from "./DiscordSessionMapper.js";
 import { renderDiscordEvent } from "./discord-render.js";
 
@@ -29,6 +33,8 @@ export class DiscordChannel implements ChannelAdapter {
   private client: any = null;
   private botUserId: string | null = null;
   private activeChats = new Set<string>();
+  private readonly elicitation = new ImElicitationHelper();
+  private readonly permissions = new ImPermissionHelper();
 
   constructor(options: DiscordChannelOptions = {}) {
     this.mapper = options.mapper ?? new DiscordSessionMapper();
@@ -94,6 +100,10 @@ export class DiscordChannel implements ChannelAdapter {
     };
   }
 
+  async deliverCronResult(delivery: CronResultDelivery): Promise<boolean> {
+    return deliverChatCronResult(delivery, this.channelKey, (chatId, text) => this.sendReply(chatId, text));
+  }
+
   private async handleMessageCreate(message: any): Promise<void> {
     if (!message?.author || message.author.bot) return;
     if (message.system) return;
@@ -104,6 +114,26 @@ export class DiscordChannel implements ChannelAdapter {
 
     const chatId = String(message.channel?.id ?? "");
     if (!chatId) return;
+
+    if (this.elicitation.hasPending(chatId) && this.gateway) {
+      try {
+        const confirmation = await this.elicitation.answer(chatId, text, this.gateway);
+        if (confirmation) await this.sendReply(chatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`discord: elicitation answer error: ${e}`);
+      }
+      return;
+    }
+
+    if (this.permissions.hasPending(chatId) && this.gateway) {
+      try {
+        const confirmation = await this.permissions.answer(chatId, text, this.gateway);
+        if (confirmation) await this.sendReply(chatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`discord: permission answer error: ${e}`);
+      }
+      return;
+    }
 
     if (this.activeChats.has(chatId)) {
       this.logger?.info?.(`discord: chat ${chatId} already active, skipping`);
@@ -137,6 +167,16 @@ export class DiscordChannel implements ChannelAdapter {
         channelKey: "discord",
         message,
       })) {
+        if (event.type === "elicitation_request") {
+          const questionText = this.elicitation.capture(chatId, sessionKey, event);
+          await this.sendReply(chatId, questionText);
+          continue;
+        }
+        if (event.type === "permission_request") {
+          const questionText = this.permissions.capture(chatId, sessionKey, event);
+          if (questionText) await this.sendReply(chatId, questionText);
+          continue;
+        }
         const fragment = renderDiscordEvent(event);
         if (fragment != null) replyText += fragment;
       }
@@ -145,33 +185,38 @@ export class DiscordChannel implements ChannelAdapter {
       replyText = "处理消息时发生错误，请重试。";
     }
 
+    this.elicitation.clear(chatId);
+    this.permissions.clear(chatId);
     const finalText = replyText.trim();
     if (finalText) {
       await this.sendReply(chatId, finalText);
     }
   }
 
-  private async sendReply(chatId: string, text: string): Promise<void> {
-    if (!this.client) return;
+  private async sendReply(chatId: string, text: string): Promise<boolean> {
+    if (!this.client) return false;
     let channel: any;
     try {
       channel = await this.client.channels.fetch(chatId);
     } catch (e) {
       this.logger?.error?.(`discord: fetch channel failed: ${e}`);
-      return;
+      return false;
     }
     if (!channel || typeof channel.send !== "function") {
       this.logger?.warn?.(`discord: channel ${chatId} not sendable`);
-      return;
+      return false;
     }
     const chunks = chunkText(text, MAX_MESSAGE_LENGTH);
+    let ok = true;
     for (const chunk of chunks) {
       try {
         await channel.send({ content: chunk });
       } catch (e) {
         this.logger?.error?.(`discord: send failed: ${e}`);
+        ok = false;
       }
     }
+    return ok;
   }
 
   private async sendTyping(chatId: string): Promise<void> {

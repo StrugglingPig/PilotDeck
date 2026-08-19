@@ -1,7 +1,11 @@
 import type { Gateway, GatewayChannelKey } from "../../../gateway/index.js";
+import type { CronResultDelivery } from "../../../cron/index.js";
 import type { ChannelAdapter, ChannelHandle, ChannelLogger, ChannelStartDeps } from "../protocol/ChannelAdapter.js";
+import { deliverChatCronResult } from "../protocol/ImCronDelivery.js";
 import { HomeAssistantSessionMapper } from "./HomeAssistantSessionMapper.js";
 import { renderHomeAssistantEvent } from "./homeassistant-render.js";
+import { ImElicitationHelper } from "../protocol/ImElicitationHelper.js";
+import { ImPermissionHelper } from "../protocol/ImPermissionHelper.js";
 
 let WebSocketImpl: any;
 try {
@@ -47,6 +51,8 @@ export class HomeAssistantChannel implements ChannelAdapter {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private authSettle: ((ok: boolean) => void) | null = null;
   private activeChats = new Set<string>();
+  private readonly elicitation = new ImElicitationHelper();
+  private readonly permissions = new ImPermissionHelper();
 
   constructor(options: HomeAssistantChannelOptions = {}) {
     this.mapper = options.mapper ?? new HomeAssistantSessionMapper();
@@ -143,6 +149,10 @@ export class HomeAssistantChannel implements ChannelAdapter {
     }
   }
 
+  async deliverCronResult(delivery: CronResultDelivery): Promise<boolean> {
+    return deliverChatCronResult(delivery, this.channelKey, (chatId, text) => this.sendReply(chatId, text));
+  }
+
   private async cleanupWs(): Promise<void> {
     if (this.ws) {
       try { this.ws.close(); } catch { /* best effort */ }
@@ -220,6 +230,26 @@ export class HomeAssistantChannel implements ChannelAdapter {
   }
 
   private async handleIncoming(chatId: string, text: string): Promise<void> {
+    if (this.elicitation.hasPending(chatId) && this.gateway) {
+      try {
+        const confirmation = await this.elicitation.answer(chatId, text, this.gateway);
+        if (confirmation) await this.sendReply(chatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`homeassistant: elicitation answer error: ${e}`);
+      }
+      return;
+    }
+
+    if (this.permissions.hasPending(chatId) && this.gateway) {
+      try {
+        const confirmation = await this.permissions.answer(chatId, text, this.gateway);
+        if (confirmation) await this.sendReply(chatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`homeassistant: permission answer error: ${e}`);
+      }
+      return;
+    }
+
     if (this.activeChats.has(chatId)) {
       this.logger?.info?.(`homeassistant: chat ${chatId} already active, skipping`);
       return;
@@ -250,6 +280,16 @@ export class HomeAssistantChannel implements ChannelAdapter {
         channelKey: "homeassistant",
         message,
       })) {
+        if (event.type === "elicitation_request") {
+          const questionText = this.elicitation.capture(chatId, sessionKey, event);
+          await this.sendReply(chatId, questionText);
+          continue;
+        }
+        if (event.type === "permission_request") {
+          const questionText = this.permissions.capture(chatId, sessionKey, event);
+          if (questionText) await this.sendReply(chatId, questionText);
+          continue;
+        }
         const fragment = renderHomeAssistantEvent(event);
         if (fragment != null) replyText += fragment;
       }
@@ -258,16 +298,19 @@ export class HomeAssistantChannel implements ChannelAdapter {
       replyText = "处理消息时发生错误，请重试。";
     }
 
+    this.elicitation.clear(chatId);
+    this.permissions.clear(chatId);
+
     const finalText = replyText.trim();
     if (finalText) {
       await this.sendReply(chatId, finalText);
     }
   }
 
-  private async sendReply(chatId: string, text: string): Promise<void> {
+  private async sendReply(chatId: string, text: string): Promise<boolean> {
     if (!this.ws || this.ws.readyState !== 1) {
       this.logger?.warn?.(`homeassistant: not connected, cannot send to ${chatId}`);
-      return;
+      return false;
     }
     const title = this.notificationTitle ?? `Gateway · ${chatId}`;
     this.sendJson({
@@ -281,5 +324,6 @@ export class HomeAssistantChannel implements ChannelAdapter {
         notification_id: `gw_${Date.now()}`,
       },
     });
+    return true;
   }
 }

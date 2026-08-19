@@ -1,9 +1,11 @@
-import type { CanonicalMessage, CanonicalModelEvent, CanonicalToolCall } from "../../model/index.js";
+import type { CanonicalMessage, CanonicalModelError, CanonicalModelEvent, CanonicalToolCall } from "../../model/index.js";
 import type { PilotDeckToolResult } from "../../tool/index.js";
 import type { AgentError } from "./errors.js";
 import type { AgentTurnResult } from "./result.js";
 import type { AgentLoopTransition } from "./state.js";
 import type { TokenBudgetSnapshot } from "../../context/budget/TokenBudgetManager.js";
+import type { RouterRetryProgressEvent } from "../../router/protocol/events.js";
+import type { FileArtifact } from "../../session/artifacts/FileArtifact.js";
 
 export type AgentEvent =
   | { type: "session_started"; sessionId: string }
@@ -23,14 +25,68 @@ export type AgentEvent =
   | { type: "permission_denied"; sessionId: string; turnId: string; toolName: string; reason: string }
   | { type: "tool_result"; sessionId: string; turnId: string; result: PilotDeckToolResult }
   | { type: "tool_results_projected"; sessionId: string; turnId: string; message: CanonicalMessage }
+  | { type: "file_artifacts"; sessionId: string; turnId: string; artifacts: FileArtifact[] }
   | { type: "mode_change_requested"; sessionId: string; turnId: string; mode: string }
   | { type: "stop_requested"; sessionId: string; turnId: string }
   | { type: "stop_failure"; sessionId: string; turnId: string; error: string }
-  | { type: "compact_started"; sessionId: string; turnId: string; trigger: string; preTokens: number }
-  | { type: "compact_completed"; sessionId: string; turnId: string; status: string; preTokens: number; postTokens?: number }
+  | {
+      type: "compact_started";
+      sessionId: string;
+      turnId: string;
+      compactionId: string;
+      trigger: string;
+      preTokens: number;
+    }
+  | {
+      type: "compact_completed";
+      sessionId: string;
+      turnId: string;
+      compactionId: string;
+      trigger: string;
+      status: string;
+      preTokens: number;
+      postTokens?: number;
+      messagesSummarized?: number;
+      cacheReset?: boolean;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+    }
   | { type: "context_budget"; sessionId: string; turnId: string; snapshot: TokenBudgetSnapshot }
-  | { type: "subagent_started"; sessionId: string; turnId: string; subagentId: string; subagentType: string }
-  | { type: "subagent_completed"; sessionId: string; turnId: string; subagentId: string; subagentType: string; success: boolean; durationMs: number }
+  | { type: "warning"; sessionId: string; turnId: string; code: string; message: string; metadata?: Record<string, unknown> }
+  | { type: "agent_status"; sessionId: string; turnId: string; event: string; detail?: Record<string, unknown> }
+  | {
+      type: "token_cap_adjusted";
+      sessionId: string;
+      turnId: string;
+      provider: string;
+      model: string;
+      cap: "context" | "output";
+      previous?: number;
+      next: number;
+      reason: string;
+    }
+  | {
+      type: "empty_output_recovery";
+      sessionId: string;
+      turnId: string;
+      provider: string;
+      model: string;
+      finishReason: string;
+      previousMaxOutputTokens?: number;
+      nextMaxOutputTokens?: number;
+    }
+  | { type: "model_recovery_failed"; sessionId: string; turnId: string; provider: string; model: string; error: CanonicalModelError }
+  | { type: "subagent_started"; sessionId: string; turnId: string; subagentId: string; subagentType: string; toolCallId?: string }
+  | {
+      type: "subagent_completed";
+      sessionId: string;
+      turnId: string;
+      subagentId: string;
+      subagentType: string;
+      success: boolean;
+      aborted?: boolean;
+      durationMs: number;
+    }
   | {
       type: "subagent_status";
       sessionId: string;
@@ -51,6 +107,7 @@ export type AgentEvent =
   | { type: "turn_continued"; sessionId: string; turnId: string; reason: AgentLoopTransition["reason"] }
   | { type: "turn_completed"; sessionId: string; turnId: string; result: AgentTurnResult }
   | { type: "turn_failed"; sessionId: string; turnId: string; error: AgentError }
+  | { type: "retry_progress"; sessionId: string; turnId: string; detail: RouterRetryProgressEvent }
   | { type: "session_aborted"; sessionId: string; reason?: string };
 
 export type AgentEventEmitter = (event: AgentEvent) => void;

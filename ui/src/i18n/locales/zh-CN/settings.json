@@ -49,6 +49,84 @@
     "resetToDefaults": "重置为默认值",
     "cancelChanges": "取消更改"
   },
+  "settingsPage": {
+    "actions": {
+      "edit": "编辑",
+      "save": "保存",
+      "cancel": "取消"
+    },
+    "backToApp": "返回应用",
+    "backToSettings": "返回设置",
+    "menu": {
+      "general": "通用",
+      "modelPool": "模型池",
+      "agent": "智能体",
+      "agentModel": "模型",
+      "agentRoute": "路由",
+      "agentMemory": "记忆",
+      "agentResident": "常驻",
+      "agentSearch": "搜索",
+      "agentSchedule": "定时任务",
+      "integrations": "外部集成",
+      "extensions": "扩展",
+      "mcpServers": "MCP 服务器",
+      "officePreview": "Office 预览",
+      "privacy": "安全隐私",
+      "advanced": "高级",
+      "about": "关于"
+    },
+    "titles": {
+      "general": "通用",
+      "modelPool": "模型池",
+      "agent": "智能体",
+      "agentModel": "智能体 / 模型",
+      "agentRoute": "智能体 / 路由",
+      "agentMemory": "智能体 / 记忆",
+      "agentResident": "智能体 / 常驻",
+      "agentSearch": "智能体 / 搜索",
+      "agentSchedule": "智能体 / 定时任务",
+      "integrations": "外部集成",
+      "extensions": "扩展",
+      "mcpServers": "扩展 / MCP 服务器",
+      "officePreview": "扩展 / Office 预览",
+      "privacy": "安全隐私",
+      "advanced": "高级",
+      "about": "关于"
+    },
+    "contentComingSoon": {
+      "title": "右侧内容区待接入",
+      "description": "后续将按菜单项逐个填充设置项组件"
+    },
+    "about": {
+      "versionStatus": "版本状态：",
+      "latestReleaseTime": "新版发布时间：",
+      "buildTime": "构建时间：",
+      "downloadAndInstall": "下载安装",
+      "downloadingAndInstalling": "下载中...",
+      "installUpdate": "安装更新",
+      "launchingInstaller": "正在启动安装程序...",
+      "restartingAndInstalling": "重启中...",
+      "status": {
+        "checking": "正在检查",
+        "updateAvailable": "有新版本",
+        "installerLaunched": "安装程序已启动",
+        "upToDate": "已是最新",
+        "unavailable": "无法获取"
+      }
+    },
+    "invalidYaml": {
+      "advanced": "配置文件当前不是有效 YAML，暂时无法加载高级配置表单。",
+      "agentModel": "配置文件当前不是有效 YAML，暂时无法加载智能体模型表单。",
+      "agentRoute": "配置文件当前不是有效 YAML，暂时无法加载智能体路由表单。",
+      "agentMemory": "配置文件当前不是有效 YAML，暂时无法加载智能体记忆表单。",
+      "agentResident": "配置文件当前不是有效 YAML，暂时无法加载智能体常驻表单。",
+      "agentSearch": "配置文件当前不是有效 YAML，暂时无法加载智能体搜索表单。",
+      "agentSchedule": "配置文件当前不是有效 YAML，暂时无法加载智能体定时任务表单。",
+      "integrations": "配置文件当前不是有效 YAML，暂时无法加载网关配置表单。",
+      "officePreview": "配置文件当前不是有效 YAML，暂时无法加载 Office 预览表单。",
+      "modelPool": "配置文件当前不是有效 YAML，暂时无法加载模型池表单。"
+    }
+  },
   "quickSettings": {
     "title": "快速设置",
     "sections": {
@@ -61,6 +139,7 @@
     "autoExpandTools": "自动展开工具",
     "showRawParameters": "显示原始参数",
     "showThinking": "显示思考过程",
+    "inlineThinking": "内联思考（打字机动画）",
     "autoScrollToBottom": "自动滚动到底部",
     "sendByCtrlEnter": "使用 Ctrl+Enter 发送",
     "sendByCtrlEnterDescription": "启用后，按 Ctrl+Enter 发送消息，而不是仅按 Enter。这对于使用输入法的用户可以避免意外发送。",
@@ -131,6 +210,13 @@
     },
     "permissions": {
       "detail": "管理允许和禁用的工具规则"
+    },
+    "telemetry": {
+      "title": "遥测",
+      "detail": "发送匿名使用数据以帮助改进产品"
+    },
+    "gateway": {
+      "detail": "连接飞书、微信等 IM 通道"
     }
   },
   "notifications": {
@@ -375,6 +461,7 @@
   },
   "permissions": {
     "title": "权限设置",
+    "controlTitle": "权限控制",
     "description": "管理助手可以无需询问即可运行的工具。从聊天中点击「添加权限」授予的项也会落到这里。",
     "export": "导出",
     "import": "导入",
@@ -438,10 +525,6 @@
           "title": "默认",
           "description": "只有受信任的命令（ls、cat、grep、git status 等）会自动运行。其他命令将被跳过。可以写入工作区。"
         },
-        "acceptEdits": {
-          "title": "接受编辑",
-          "description": "所有命令在工作区内自动运行。具有沙箱执行的全自动模式。"
-        },
         "bypassPermissions": {
           "title": "绕过权限",
           "description": "完全系统访问，无任何限制。所有命令自动运行，具有完整的磁盘和网络访问权限。请谨慎使用。"
@@ -450,7 +533,6 @@
       "technicalDetails": "技术详情",
       "technicalInfo": {
         "default": "sandboxMode=workspace-write, approvalPolicy=untrusted。受信任的命令：cat、cd、grep、head、ls、pwd、tail、git status/log/diff/show、find（不带 -exec）等。",
-        "acceptEdits": "sandboxMode=workspace-write, approvalPolicy=never。所有命令在项目目录内自动执行。",
         "bypassPermissions": "sandboxMode=danger-full-access, approvalPolicy=never。完全系统访问权限，仅在可信环境中使用。",
         "overrideNote": "您可以使用聊天界面中的模式按钮按会话覆盖此设置。"
       }
@@ -554,6 +636,9 @@
 	    "actions": {
 	      "opening": "正在打开...",
 	      "revealFile": "在访达中显示",
+	      "revealFileMac": "在访达中显示",
+	      "revealFileWindows": "在资源管理器中显示",
+	      "revealFileGeneric": "在文件管理器中显示",
 	      "refresh": "刷新",
 	      "reloadCurrent": "重新加载当前配置",
 	      "saving": "保存中...",
@@ -570,6 +655,7 @@
 	      "unsavedChanges": "未保存更改",
 	      "noUnsavedChanges": "无未保存更改",
 	      "fixYamlInFilesystem": "请在文件系统中修复配置文件后刷新。",
+	      "fixYamlInRawEditor": "请先修复下方原始 YAML，然后保存以重新启用表单设置。",
 	      "subsystems": {
 	        "pending": "等待配置解析。",
 	        "processEnv": {
@@ -600,14 +686,16 @@
 	      "configInvalidSeeBelow": "配置存在校验错误——见下方",
 	      "errors": "错误",
 	      "warnings": "警告",
-	      "yamlParseError": "配置文件 YAML 解析失败。请在文件系统中修复后刷新。",
-	      "cannotParse": "无法解析配置文件 YAML。请在文件系统中修复后点击刷新。",
+	      "yamlParseError": "配置文件 YAML 解析失败。请修复下方原始 YAML 后保存。",
+	      "yamlParseErrorWithDetail": "配置文件 YAML 解析失败：{{error}}",
+	      "cannotParse": "无法解析配置文件 YAML。请修复上方原始 YAML 后保存，以恢复表单设置。",
 	      "rawYaml": "原始 YAML"
 	    },
     "sectionGroups": {
       "basic": "基础",
       "basicDescription": "运行本服务前需要配置模型服务。",
       "features": "功能",
+      "extensions": "扩展",
       "advanced": "高级"
     },
     "sections": {
@@ -628,6 +716,10 @@
         "label": "常驻",
         "description": "自动发现和工作区启用设置"
       },
+      "cron": {
+        "label": "Cron",
+        "description": "定时后台任务运行时"
+      },
       "memory": {
         "label": "记忆",
         "description": "PilotDeck 记忆服务"
@@ -647,6 +739,10 @@
       "gateway": {
         "label": "网关",
         "description": "消息网关主页和频道"
+      },
+      "officePreview": {
+        "label": "Office 文件预览服务",
+        "description": "Word、Excel、PPT 只读预览"
       }
     },
     "panels": {
@@ -658,12 +754,59 @@
           "host": { "label": "主机", "description": "HTTP/WebSocket 服务器的绑定接口。" },
           "serverPort": { "label": "服务器端口", "description": "Express + WebSocket 端口。" },
           "vitePort": { "label": "Vite 端口", "description": "前端开发服务器（仅在运行 npm run dev 时使用）。" },
-          "proxyPort": { "label": "代理端口", "description": "本地 LLM 代理（PilotDeck 智能体目标）。" },
           "apiTimeout": { "label": "API 超时（毫秒）", "description": "每次请求的上游超时。" },
           "databasePath": { "label": "数据库路径", "description": "SQLite 认证/项目数据库（~ 展开为主目录）。" },
           "workspacesRoot": { "label": "工作区根目录", "description": "项目扫描的根目录。" },
-          "httpsProxy": { "label": "HTTPS 代理", "description": "出站 HTTPS 代理 URL（HTTPS_PROXY / https_proxy）。" }
+          "proxyUrl": { "label": "HTTPS 代理", "description": "出站 HTTPS 代理 URL，同时作用于 Gateway 和 UI Server（对应 pilotdeck.yaml 中的 proxy.url）。" },
+          "proxyNoProxy": { "label": "代理排除列表", "description": "逗号分隔的主机名/IP，这些地址不走代理（对应 pilotdeck.yaml 中的 proxy.noProxy）。127.0.0.1 和 localhost 始终排除。" }
         }
+      },
+      "officePreview": {
+        "title": "Office 文件预览服务",
+        "description": "选择 Office 文件的只读预览方式。PDF 始终使用 PilotDeck 内置浏览器，不受此设置影响。",
+        "fields": {
+          "service": {
+            "label": "预览服务",
+            "description": "内置预览无需安装，支持 DOCX、XLSX 和 PPTX；LibreOffice 兼容更多旧版格式并统一使用打印版式。"
+          },
+          "binaryPath": {
+            "label": "LibreOffice 可执行文件路径",
+            "description": "可选。自定义安装位置时填写 soffice/libreoffice 的完整路径；留空则自动探测。",
+            "placeholder": "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+          },
+          "detectedBinaryPath": {
+            "label": "自动扫描结果",
+            "description": "选择扫描到的可用路径会写入上面的可执行文件路径；选择自动探测会清空手动路径。"
+          }
+        },
+        "options": {
+          "builtin": "内置预览（推荐）",
+          "libreOffice": "LibreOffice 兼容预览",
+          "libreOfficeUnavailable": "LibreOffice（不可用）",
+          "autoDetect": "自动探测（不指定路径）",
+          "candidateAvailable": "{{path}}（可用）",
+          "candidateUnavailable": "{{path}}（不可用）",
+          "candidateAvailableShort": "可用",
+          "candidateUnavailableShort": "不可用"
+        },
+        "scan": {
+          "button": "扫描",
+          "title": "选择 LibreOffice 路径",
+          "scanning": "正在扫描可用路径..."
+        },
+        "status": {
+          "checking": "正在检查 LibreOffice...",
+          "available": "LibreOffice 可用",
+          "unavailable": "LibreOffice 不可用",
+          "unknown": "LibreOffice 状态暂不可用",
+          "error": "无法检查 LibreOffice 状态",
+          "refresh": "重新检查",
+          "noDetectedPaths": "暂未扫描到可用候选路径。你仍然可以手动填写完整路径后重新检查。",
+          "path": "路径：{{path}}",
+          "version": "版本：{{version}}"
+        },
+        "builtinNote": "内置预览开箱即用：DOCX 保留文档版式，XLSX 支持工作表切换和单元格选择，PPTX 支持幻灯片浏览。旧版 DOC、XLS、PPT 等格式需要 LibreOffice。",
+        "unavailableWarning": "当前选择了 LibreOffice，但本机没有可用的 LibreOffice/soffice。请安装 LibreOffice，或将预览服务切换为“内置预览”。"
       },
       "models": {
         "title": "模型池",
@@ -680,21 +823,32 @@
         "protocol": "协议",
         "protocolOptions": {
           "openai": "openai（聊天补全）",
-          "anthropic": "anthropic（消息 API）"
+          "openaiResponses": "openai-responses（Responses API）",
+          "anthropic": "anthropic（消息 API）",
+          "google": "google（Gemini API）"
         },
         "baseUrl": "接口地址",
-        "baseUrlHint": "OpenAI 兼容接口请填到 /v1，例如 https://api.example.com/v1。",
+        "baseUrlHint": "原生 Google Gemini 使用 https://generativelanguage.googleapis.com。OpenAI 兼容接口与 Responses API 请填到 /v1。",
         "defaultsTo": "默认使用目录中的",
         "fromCatalog": "。",
         "effective": "实际地址：",
         "apiKey": "API 密钥",
+        "optional": "可选",
         "maskedKeyPlaceholder": "已保留现有密钥，如需替换请重新输入",
         "keyHidden": "密钥已隐藏；留空会继续保留，重新输入可替换。",
         "enabledModels": "已启用模型",
         "supportsImageInput": "支持图片输入",
         "clickEnable": "点击启用",
         "clickDisable": "点击禁用",
-        "customModelPlaceholder": "自定义模型 ID"
+        "customModelPlaceholder": "自定义模型 ID",
+        "providerAdvancedToggle": "高级重试设置",
+        "providerRetry": {
+          "requestMaxRetries": { "label": "请求最大重试次数", "description": "非流式请求的最大重试次数。" },
+          "streamMaxRetries": { "label": "流式最大重试次数", "description": "流式请求的最大重试次数。" },
+          "streamIdleTimeoutMs": { "label": "流式空闲超时（毫秒）", "description": "在此时间内没有收到数据则中止流。默认 600000 毫秒。" },
+          "baseDelayMs": { "label": "基础延迟（毫秒）", "description": "首次重试前的初始等待时间。" },
+          "maxDelayMs": { "label": "最大延迟（毫秒）", "description": "两次重试之间的最长等待时间。" }
+        }
       },
       "agents": {
         "title": "智能体",
@@ -706,7 +860,7 @@
         },
         "capabilities": {
           "title": "模型设置",
-          "imageInput": "图片输入",
+          "imageInput": "模型支持图片输入",
           "enabled": "已启用",
           "disabled": "已禁用",
           "overrideActive": "已手动设置图片输入。",
@@ -764,6 +918,7 @@
           "gitWorktree": { "label": "Git 工作树根目录", "description": "基于 Git 工作树隔离的根目录。" },
           "snapshotDir": { "label": "快照根目录", "description": "基于快照隔离的根目录。" },
           "snapshotMaxBytes": { "label": "快照最大字节数", "description": "工作区快照的最大大小。" },
+          "maxPlansPerCycle": { "label": "每周期最大计划数", "description": "单个隔离环境周期内最多可累计执行的计划数量。" },
           "gitLfs": { "label": "Git LFS", "description": "在工作区快照中包含 Git LFS 对象。" }
         },
         "execution": {
@@ -779,9 +934,25 @@
           "empty": "尚未识别到项目。请先添加或打开一个工作区。"
         }
       },
+      "cron": {
+        "title": "Cron",
+        "description": "配置 Cron 任务使用的后台调度器。任务创建和管理在 Cron 模块中完成。",
+        "enabled": {
+          "label": "启用",
+          "description": "定时 Cron 后台任务的总开关。"
+        },
+        "timezone": {
+          "label": "时区",
+          "description": "调度器默认使用的 IANA 时区。"
+        },
+        "maxConcurrentRuns": {
+          "label": "最大并发运行数",
+          "description": "同一时间允许执行的 Cron 运行数量上限。"
+        }
+      },
       "memory": {
         "title": "记忆",
-        "description": "配置记忆索引与 Dream 使用的模型。",
+        "description": "配置记忆服务、自动构建间隔，以及项目记忆的数据管理。",
         "enabled": {
           "label": "启用",
           "description": "启用记忆服务的总开关。"
@@ -790,11 +961,71 @@
           "label": "记忆模型",
           "description": "记忆管线使用的提供商/模型。",
           "inherit": "继承（使用主智能体模型）"
+        },
+        "automation": {
+          "autoIndex": {
+            "label": "自动索引间隔（分钟）",
+            "description": "0 表示关闭自动索引任务。"
+          },
+          "autoDream": {
+            "label": "自动 Dream 间隔（分钟）",
+            "description": "只有记忆文件更新后，自动 Dream 才会真正执行。"
+          }
+        },
+        "autoIndexInterval": {
+          "label": "自动索引间隔",
+          "description": "自动扫描文件的时间周期，“0”表示关闭自动任务。"
+        },
+        "autoDreamInterval": {
+          "label": "自动 Dream 间隔",
+          "description": "自动整理记忆的时间周期。只有自上次 Dream 以来有记忆文件更新时，自动 Dream 才会真正执行。"
+        },
+        "intervalUnits": {
+          "minutes": "分钟",
+          "hours": "小时"
+        },
+        "data": {
+          "title": "数据管理",
+          "description": "导出、导入或清空某个项目，或全部记忆。",
+          "target": {
+            "label": "管理对象",
+            "description": "选择要管理的项目或全部记忆。",
+            "all": "全部记忆",
+            "projectFallback": "未命名项目"
+          },
+          "actions": {
+            "export": "导出",
+            "import": "导入",
+            "clear": "清空"
+          },
+          "status": {
+            "exporting": "正在导出 {{target}}...",
+            "exported": "已导出 {{target}}。",
+            "importing": "正在导入 {{target}}...",
+            "imported": "已导入 {{target}}。",
+            "clearing": "正在清空 {{target}}...",
+            "cleared": "已清空 {{target}}。"
+          },
+          "confirm": {
+            "importProject": "导入会覆盖“{{target}}”的项目记忆。确认继续吗？",
+            "importAll": "导入会覆盖全部记忆。确认继续吗？",
+            "clearProject": "确认清空“{{target}}”的项目记忆吗？",
+            "clearAll": "确认清空全部记忆吗？这会删除所有项目记忆和全局用户背景。"
+          },
+          "errors": {
+            "missingProject": "没有可用项目。",
+            "invalidImport": "请选择有效的 JSON 备份文件。",
+            "invalidExport": "导出的内容不是有效 JSON。"
+          }
         }
       },
       "tools": {
         "title": "搜索",
         "description": "配置智能体 web_search 工具使用的搜索服务。",
+        "enabled": {
+          "label": "启用 Web 搜索",
+          "description": "关闭后，智能体将不会获得 web_search 工具。"
+        },
         "provider": {
           "label": "搜索提供商",
           "description": "当前启用的搜索服务。",
@@ -884,6 +1115,13 @@
           "label": "Zero-usage 重试",
           "description": "上游返回零 Token 用量响应时自动重试。",
           "maxAttempts": { "label": "最大重试次数", "description": "放弃前的最大重试次数。" }
+        },
+        "transientRetry": {
+          "label": "瞬态错误重试",
+          "description": "遇到瞬态错误（限流、服务端错误、过载）时自动重试，采用指数退避策略。",
+          "maxAttempts": { "label": "最大重试次数", "description": "放弃前的最大重试次数。" },
+          "baseDelayMs": { "label": "基础延迟（毫秒）", "description": "首次重试前的初始等待时间。" },
+          "maxDelayMs": { "label": "最大延迟（毫秒）", "description": "两次重试之间的最长等待时间。" }
         },
         "tokenSaver": {
           "title": "Token 节省",
@@ -985,5 +1223,99 @@
     "installAriaLabel": "插件 git 仓库 URL",
     "tab": "标签",
     "runningStatus": "运行中"
+  },
+  "about": {
+    "title": "关于",
+    "version": "版本",
+    "checking": "正在检查更新...",
+    "upToDate": "已是最新版本",
+    "updateAvailable": "有新版本可用",
+    "unavailable": "无法获取更新信息",
+    "checkForUpdates": "检查更新",
+    "currentVersion": "当前版本：{{version}}",
+    "latestVersion": "最新版本：{{version}}",
+    "updateNow": "立即更新",
+    "updating": "更新中...",
+    "updateComplete": "更新完成！",
+    "updateFailed": "更新失败",
+    "restartToApply": "重启以应用",
+    "downloadUpdate": "下载更新",
+    "downloading": "下载中... {{percent}}%",
+    "downloadComplete": "下载完成",
+    "downloadFailed": "下载失败",
+    "installUpdate": "安装更新",
+    "cancelDownload": "取消下载",
+    "dismiss": "关闭"
+  },
+  "gateway": {
+    "title": "IM 通道",
+    "description": "配置即时通讯通道（飞书、微信、企业微信），让 Agent 可通过 IM 应用被访问。",
+    "connected": "已连接",
+    "notConfigured": "未配置",
+    "enabled": "已启用",
+    "loadFailed": "无法加载 IM 通道状态，请稍后重试",
+    "edit": "编辑",
+    "setup": "配置",
+    "testConnection": "测试连接",
+    "save": "保存",
+    "disable": "停用",
+    "cancel": "取消",
+    "dismiss": "关闭",
+    "feishu": {
+      "title": "飞书 / Lark",
+      "label": "飞书机器人",
+      "domain": "域名",
+      "domainOptions": {
+        "feishu": "feishu.cn（飞书）",
+        "lark": "larksuite.com（Lark）"
+      },
+      "connectionMode": "连接方式",
+      "chooseMethod": "选择配置飞书机器人的方式：",
+      "qrScan": "扫码创建",
+      "qrScanDesc": "用飞书 App 扫码自动创建机器人",
+      "manualInput": "手动输入",
+      "manualInputDesc": "从开发者后台获取 App ID 和 Secret",
+      "startQr": "生成二维码",
+      "connecting": "正在连接飞书…",
+      "scanPrompt": "请打开飞书 / Lark App 扫描二维码",
+      "qrSuccess": "应用创建成功 — 配置已保存并启用",
+      "retry": "重试"
+    },
+    "weixin": {
+      "title": "微信 (iLink)",
+      "label": "微信机器人",
+      "qrLogin": "扫码登录",
+      "relogin": "重新登录",
+      "loadingQr": "正在生成二维码…",
+      "scanPrompt": "请打开微信扫描二维码登录",
+      "loginSuccess": "登录成功 — 凭据已保存",
+      "waitingForLogin": "微信等待扫码登录",
+      "starting": "微信通道正在启动",
+      "expired": "微信登录已过期，请重新扫码",
+      "failed": "微信通道启动失败",
+      "qrPreparing": "微信后台通道正在准备二维码，请稍后再试",
+      "noRuntimeQr": "当前没有可用二维码，请确认微信通道已启用并正在等待登录"
+    },
+    "wecom": {
+      "title": "企业微信 WeCom",
+      "label": "企业微信机器人",
+      "chooseMethod": "选择配置企业微信 AI Bot 的方式：",
+      "qrSetup": "扫码配置",
+      "qrSetupDesc": "用企业微信 App 扫码自动创建或获取机器人凭据",
+      "manualInput": "手动输入",
+      "manualInputDesc": "从企业微信管理后台复制 Bot ID 和 Secret",
+      "startQr": "生成企业微信二维码",
+      "connecting": "正在连接企业微信…",
+      "scanPrompt": "请打开企业微信 App 扫描二维码",
+      "qrSuccess": "企业微信配置成功 — Bot 凭据已保存并启用",
+      "retry": "重试",
+      "botId": "Bot ID",
+      "secret": "Secret",
+      "websocketUrl": "WebSocket URL",
+      "dmPolicy": "私聊策略",
+      "groupPolicy": "群聊策略",
+      "policyHint": "基础策略会写入 pilotdeck.yaml；更细粒度的用户或群白名单可稍后手动编辑 YAML。",
+      "saveSuccess": "企业微信配置已保存"
+    }
   }
 }

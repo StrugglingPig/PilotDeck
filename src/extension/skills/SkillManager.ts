@@ -54,29 +54,35 @@ const RISKY_EXTS = new Set([
 export type SkillManagerOptions = {
   /** Resolved `~/.pilotdeck` root. Required. */
   pilotHome: string;
+  /** Read-only skills shipped with the active PilotDeck build. */
+  builtinSkillsRoot?: string;
   /**
    * "General chat" cwds we treat as not-a-real-project. Defaults to
    * `pilotHome` (~/.pilotdeck). When the caller passes a `projectKey`
    * matching one of these, the manager behaves as if no project was set —
-   * only user-scope skills are visible.
+   * built-in and user-scope skills are visible, but project skills are not.
    */
   generalCwdPaths?: string[];
 };
 
 /**
  * Authoritative skill-CRUD layer used by every host (gateway clients,
- * UI server, future SDK callers). Owns the on-disk layout under
- * `~/.pilotdeck/skills/` (user scope) and `<projectRoot>/.pilotdeck/skills/`
- * (project scope). Legacy third-party skill directories are intentionally
- * not consulted — conflating them with PilotDeck's layout caused the
- * UI/agent skill drift the migration fixes.
+ * UI server, future SDK callers). Reads the release's bundled skill root and
+ * owns the editable layouts under `~/.pilotdeck/skills/` (user scope) and
+ * `<projectRoot>/.pilotdeck/skills/` (project scope). Legacy third-party skill
+ * directories are intentionally not consulted — conflating them with
+ * PilotDeck's layout caused the UI/agent skill drift the migration fixes.
  */
 export class SkillManager {
   private readonly pilotHome: string;
+  private readonly builtinSkillsRootPath: string | null;
   private readonly generalCwdPaths: string[];
 
   constructor(options: SkillManagerOptions) {
     this.pilotHome = resolve(options.pilotHome);
+    this.builtinSkillsRootPath = options.builtinSkillsRoot
+      ? resolve(options.builtinSkillsRoot)
+      : null;
     const defaults = [this.pilotHome];
     this.generalCwdPaths = (options.generalCwdPaths ?? defaults).map((p) => resolve(p));
   }
@@ -87,6 +93,13 @@ export class SkillManager {
 
   private userSkillsRoot(): string {
     return getPilotExtensionPaths(this.pilotHome, this.pilotHome).globalSkillsDir;
+  }
+
+  private builtinSkillsRoot(): string {
+    if (!this.builtinSkillsRootPath) {
+      throw new SkillManagerError("not_configured", "Built-in skills root is not configured.");
+    }
+    return this.builtinSkillsRootPath;
   }
 
   private projectSkillsRoot(projectRoot: string): string {
@@ -100,6 +113,9 @@ export class SkillManager {
 
   /** Resolve a `(scope, slug, projectKey)` triple to a target dir. */
   private resolveScopeRoot(scope: SkillScope, projectKey: string | null | undefined): string {
+    if (scope === "builtin") {
+      return this.builtinSkillsRoot();
+    }
     if (scope === "project") {
       if (!projectKey || this.isGeneralCwd(projectKey)) {
         throw new SkillManagerError(
@@ -110,6 +126,15 @@ export class SkillManager {
       return this.projectSkillsRoot(projectKey);
     }
     return this.userSkillsRoot();
+  }
+
+  private assertMutableScope(scope: SkillScope): void {
+    if (scope === "builtin") {
+      throw new SkillManagerError(
+        "read_only",
+        "Built-in skills are read-only. Create a user or project override to edit this skill.",
+      );
+    }
   }
 
   private resolveSkillDir(input: SkillAddressInput): string {
@@ -131,15 +156,71 @@ export class SkillManager {
     const projectKey = input.projectKey ?? null;
     const effectiveProject = this.isGeneralCwd(projectKey) ? null : projectKey;
 
+    const builtinSkills = this.builtinSkillsRootPath
+      ? await listSkillsIn(this.builtinSkillsRootPath, "builtin")
+      : [];
     const userSkills = await listSkillsIn(this.userSkillsRoot(), "user");
     const projectSkills = effectiveProject
       ? await listSkillsIn(this.projectSkillsRoot(effectiveProject), "project")
       : [];
 
+    const builtinSlugs = new Set(builtinSkills.map((skill) => skill.slug));
+    const userSlugs = new Set(userSkills.map((skill) => skill.slug));
+    const projectSlugs = new Set(projectSkills.map((skill) => skill.slug));
+
+    const builtin = builtinSkills.map((skill) => ({
+        ...skill,
+        ...(projectSlugs.has(skill.slug)
+          ? { overriddenBy: "project" as const }
+          : userSlugs.has(skill.slug)
+            ? { overriddenBy: "user" as const }
+            : {}),
+      }));
+    const user = userSkills.map((skill) => ({
+        ...skill,
+        ...(builtinSlugs.has(skill.slug) ? { overridesBuiltin: true } : {}),
+        ...(projectSlugs.has(skill.slug) ? { overriddenBy: "project" as const } : {}),
+      }));
+    const project = projectSkills.map((skill) => ({
+        ...skill,
+        ...(builtinSlugs.has(skill.slug) ? { overridesBuiltin: true } : {}),
+      }));
+    const scope = input.scope ?? "all";
+    if (!(["builtin", "user", "project", "plugin", "all"] as const).includes(scope)) {
+      throw new SkillManagerError("invalid_input", `Invalid skill scope: ${String(scope)}.`);
+    }
+    const query = (input.query ?? "").trim().toLocaleLowerCase();
+    if (query.length > 256) throw new SkillManagerError("invalid_input", "query must not exceed 256 characters.");
+    const limit = input.limit ?? 10;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+      throw new SkillManagerError("invalid_input", "limit must be an integer between 1 and 50.");
+    }
+    const signature = Buffer.from(JSON.stringify({ projectKey: effectiveProject, query, scope })).toString("base64url");
+    const offset = decodeListCursor(input.cursor, signature);
+    const selected = scope === "builtin" ? builtin
+      : scope === "user" ? user
+        : scope === "project" ? project
+          : scope === "plugin" ? []
+            : [...builtin, ...user, ...project];
+    const searchable = selected
+      .map((skill) => ({ ...skill, command: `/${skill.slug}`, matches: skillMatches(skill, query) }))
+      .filter((skill) => !query || skill.matches.length > 0)
+      .sort((left, right) => left.command.localeCompare(right.command));
+    const items = searchable.slice(offset, offset + limit).map((item) => ({
+      ...item,
+      ...(item.matches.length > 0 ? { matches: item.matches } : {}),
+    }));
+    const nextOffset = offset + items.length;
+
     return {
-      user: userSkills,
-      project: projectSkills,
+      builtin,
+      user,
+      project,
       projectPath: effectiveProject,
+      items,
+      ...(nextOffset < searchable.length
+        ? { nextCursor: Buffer.from(JSON.stringify({ offset: nextOffset, signature })).toString("base64url") }
+        : {}),
     };
   }
 
@@ -160,6 +241,7 @@ export class SkillManager {
   }
 
   async write(input: SkillWriteInput): Promise<SkillWriteResult> {
+    this.assertMutableScope(input.scope);
     if (typeof input.content !== "string") {
       throw new SkillManagerError("invalid_input", "content (string) is required.");
     }
@@ -172,6 +254,7 @@ export class SkillManager {
   }
 
   async create(input: SkillCreateInput): Promise<SkillCreateResult> {
+    this.assertMutableScope(input.scope);
     const skillDir = this.resolveSkillDir(input);
     let exists = false;
     try {
@@ -208,6 +291,7 @@ export class SkillManager {
   }
 
   async delete(input: SkillDeleteInput): Promise<SkillDeleteResult> {
+    this.assertMutableScope(input.scope);
     const skillDir = this.resolveSkillDir(input);
     try {
       await fs.rm(skillDir, { recursive: true, force: true });
@@ -233,6 +317,7 @@ export class SkillManager {
   }
 
   async import(input: SkillImportInput): Promise<SkillImportResult> {
+    this.assertMutableScope(input.scope);
     if (typeof input.sourcePath !== "string" || !input.sourcePath.trim()) {
       throw new SkillManagerError("invalid_input", "sourcePath is required.");
     }
@@ -339,15 +424,21 @@ export class SkillManager {
     const resolvedRoot = resolve(expandHome(input.parentPath.trim()));
     let entries: import("node:fs").Dirent[];
     try {
+      const rootStat = await fs.stat(resolvedRoot);
+      if (!rootStat.isDirectory()) {
+        throw new SkillManagerError("not_directory", `Path is not a directory: ${resolvedRoot}`);
+      }
       entries = await fs.readdir(resolvedRoot, { withFileTypes: true });
     } catch (e) {
+      if (e instanceof SkillManagerError) throw e;
       if ((e as NodeJS.ErrnoException).code === "ENOENT") {
         throw new SkillManagerError("not_found", `Directory not found: ${resolvedRoot}`);
       }
       throw e;
     }
 
-    const folders: SkillScanFolder[] = [];
+    const currentFolder = await buildSkillScanFolder(resolvedRoot, basename(resolvedRoot));
+    const childFolders: SkillScanFolder[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       let isDir = entry.isDirectory();
@@ -362,52 +453,17 @@ export class SkillManager {
       if (!isDir) continue;
 
       const subDir = join(resolvedRoot, entry.name);
-      let hasSkillMd = false;
-      let meta: SkillSummary | null = null;
-      try {
-        await fs.access(join(subDir, "SKILL.md"));
-        hasSkillMd = true;
-        meta = await readSkillMeta(subDir, "user");
-      } catch {
-        /* no SKILL.md */
-      }
-
-      let fileCount = 0;
-      let totalSize = 0;
-      if (hasSkillMd) {
-        try {
-          const files = await fs.readdir(subDir, { recursive: true, withFileTypes: false });
-          for (const f of files) {
-            try {
-              const st = await fs.stat(join(subDir, String(f)));
-              if (st.isFile()) {
-                fileCount++;
-                totalSize += st.size;
-              }
-            } catch {
-              /* skip */
-            }
-          }
-        } catch {
-          /* skip */
-        }
-      }
-
-      folders.push({
-        folderName: entry.name,
-        hasSkillMd,
-        name: meta?.name ?? null,
-        description: meta?.description ?? null,
-        sourcePath: subDir,
-        fileCount,
-        totalSize,
-      });
+      childFolders.push(await buildSkillScanFolder(subDir, entry.name));
     }
 
-    folders.sort((a, b) => {
+    childFolders.sort((a, b) => {
       if (a.hasSkillMd !== b.hasSkillMd) return a.hasSkillMd ? -1 : 1;
       return a.folderName.localeCompare(b.folderName);
     });
+
+    const folders = currentFolder.hasSkillMd
+      ? [currentFolder, ...childFolders]
+      : childFolders;
 
     return { parentPath: resolvedRoot, folders };
   }
@@ -590,7 +646,51 @@ async function readSkillMeta(skillDir: string, scope: SkillScope): Promise<Skill
     skillFile,
     skillDir,
     scope,
+    readonly: scope === "builtin",
     mtime,
+  };
+}
+
+async function buildSkillScanFolder(skillDir: string, folderName: string): Promise<SkillScanFolder> {
+  let hasSkillMd = false;
+  let meta: SkillSummary | null = null;
+  try {
+    await fs.access(join(skillDir, "SKILL.md"));
+    hasSkillMd = true;
+    meta = await readSkillMeta(skillDir, "user");
+  } catch {
+    /* no SKILL.md */
+  }
+
+  let fileCount = 0;
+  let totalSize = 0;
+  if (hasSkillMd) {
+    try {
+      const files = await fs.readdir(skillDir, { recursive: true, withFileTypes: false });
+      for (const file of files) {
+        try {
+          const stats = await fs.stat(join(skillDir, String(file)));
+          if (stats.isFile()) {
+            fileCount++;
+            totalSize += stats.size;
+          }
+        } catch {
+          /* skip */
+        }
+      }
+    } catch {
+      /* skip */
+    }
+  }
+
+  return {
+    folderName,
+    hasSkillMd,
+    name: meta?.name ?? null,
+    description: meta?.description ?? null,
+    sourcePath: skillDir,
+    fileCount,
+    totalSize,
   };
 }
 
@@ -783,6 +883,49 @@ function extOf(name: string): string {
   const idx = name.lastIndexOf(".");
   if (idx <= 0) return "";
   return name.slice(idx);
+}
+
+function skillMatches(
+  skill: SkillSummary,
+  query: string,
+): Array<{ field: "name" | "description"; start: number; end: number }> {
+  if (!query) return [];
+  const matches: Array<{ field: "name" | "description"; start: number; end: number }> = [];
+  appendSkillMatches(matches, "name", skill.name, query);
+  appendSkillMatches(matches, "description", skill.description, query);
+  return matches;
+}
+
+function appendSkillMatches(
+  output: Array<{ field: "name" | "description"; start: number; end: number }>,
+  field: "name" | "description",
+  value: string,
+  query: string,
+): void {
+  const searchable = value.toLocaleLowerCase();
+  let offset = 0;
+  while (offset <= searchable.length - query.length) {
+    const start = searchable.indexOf(query, offset);
+    if (start < 0) break;
+    output.push({ field, start, end: start + query.length });
+    offset = start + Math.max(query.length, 1);
+  }
+}
+
+function decodeListCursor(value: string | undefined, signature: string): number {
+  if (!value) return 0;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as {
+      offset?: unknown;
+      signature?: unknown;
+    };
+    if (!Number.isInteger(parsed.offset) || (parsed.offset as number) < 0 || parsed.signature !== signature) {
+      throw new Error("invalid cursor");
+    }
+    return parsed.offset as number;
+  } catch {
+    throw new SkillManagerError("invalid_input", "cursor is invalid or does not match the query.");
+  }
 }
 
 function validateFromManifest(

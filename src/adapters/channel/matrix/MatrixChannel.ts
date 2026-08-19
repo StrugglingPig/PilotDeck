@@ -1,8 +1,12 @@
 import { join } from "node:path";
 import type { Gateway, GatewayChannelKey } from "../../../gateway/index.js";
+import type { CronResultDelivery } from "../../../cron/index.js";
 import type { ChannelAdapter, ChannelHandle, ChannelLogger, ChannelStartDeps } from "../protocol/ChannelAdapter.js";
+import { deliverChatCronResult } from "../protocol/ImCronDelivery.js";
 import { MatrixSessionMapper } from "./MatrixSessionMapper.js";
 import { renderMatrixEvent } from "./matrix-render.js";
+import { ImElicitationHelper } from "../protocol/ImElicitationHelper.js";
+import { ImPermissionHelper } from "../protocol/ImPermissionHelper.js";
 
 let MatrixSdk: any;
 try {
@@ -36,6 +40,8 @@ export class MatrixChannel implements ChannelAdapter {
   private client: any = null;
   private userId: string | null = null;
   private activeChats = new Set<string>();
+  private readonly elicitation = new ImElicitationHelper();
+  private readonly permissions = new ImPermissionHelper();
 
   constructor(options: MatrixChannelOptions = {}) {
     this.mapper = options.mapper ?? new MatrixSessionMapper();
@@ -107,6 +113,10 @@ export class MatrixChannel implements ChannelAdapter {
     };
   }
 
+  async deliverCronResult(delivery: CronResultDelivery): Promise<boolean> {
+    return deliverChatCronResult(delivery, this.channelKey, (chatId, text) => this.sendReply(chatId, text));
+  }
+
   private async handleRoomMessage(roomId: string, raw: any): Promise<void> {
     const sender = raw?.sender as string | undefined;
     if (!sender) return;
@@ -122,6 +132,26 @@ export class MatrixChannel implements ChannelAdapter {
 
     const text = String(content.body ?? "").trim();
     if (!text) return;
+
+    if (this.elicitation.hasPending(roomId) && this.gateway) {
+      try {
+        const confirmation = await this.elicitation.answer(roomId, text, this.gateway);
+        if (confirmation) await this.sendReply(roomId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`matrix: elicitation answer error: ${e}`);
+      }
+      return;
+    }
+
+    if (this.permissions.hasPending(roomId) && this.gateway) {
+      try {
+        const confirmation = await this.permissions.answer(roomId, text, this.gateway);
+        if (confirmation) await this.sendReply(roomId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`matrix: permission answer error: ${e}`);
+      }
+      return;
+    }
 
     if (this.activeChats.has(roomId)) {
       this.logger?.info?.(`matrix: room ${roomId} already active, skipping`);
@@ -153,6 +183,16 @@ export class MatrixChannel implements ChannelAdapter {
         channelKey: "matrix",
         message,
       })) {
+        if (event.type === "elicitation_request") {
+          const questionText = this.elicitation.capture(roomId, sessionKey, event);
+          await this.sendReply(roomId, questionText);
+          continue;
+        }
+        if (event.type === "permission_request") {
+          const questionText = this.permissions.capture(roomId, sessionKey, event);
+          if (questionText) await this.sendReply(roomId, questionText);
+          continue;
+        }
         const fragment = renderMatrixEvent(event);
         if (fragment != null) replyText += fragment;
       }
@@ -161,15 +201,19 @@ export class MatrixChannel implements ChannelAdapter {
       replyText = "处理消息时发生错误，请重试。";
     }
 
+    this.elicitation.clear(roomId);
+    this.permissions.clear(roomId);
+
     const finalText = replyText.trim();
     if (finalText) {
       await this.sendReply(roomId, finalText);
     }
   }
 
-  private async sendReply(roomId: string, text: string): Promise<void> {
-    if (!this.client) return;
+  private async sendReply(roomId: string, text: string): Promise<boolean> {
+    if (!this.client) return false;
     const chunks = chunkText(text, MAX_MESSAGE_LENGTH);
+    let ok = true;
     for (const chunk of chunks) {
       try {
         await this.client.sendMessage(roomId, {
@@ -178,8 +222,10 @@ export class MatrixChannel implements ChannelAdapter {
         });
       } catch (e) {
         this.logger?.error?.(`matrix: sendMessage failed: ${e}`);
+        ok = false;
       }
     }
+    return ok;
   }
 }
 

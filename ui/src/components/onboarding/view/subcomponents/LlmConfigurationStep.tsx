@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Check, ChevronDown, Loader2, Plus } from 'lucide-react';
 import { authenticatedFetch } from '../../../../utils/api';
-import { CATALOG_PROVIDERS, findCatalogProviderByUrl, type CatalogProvider } from '../../../../shared/catalogProviders';
+import {
+  CATALOG_PROVIDERS,
+  findCatalogProviderByUrl,
+  type CatalogProvider,
+  type CatalogProviderProtocol,
+} from '../../../../shared/catalogProviders';
+import { fetchProviderModels, fetchRemoteDefaultModels, type ApiModelListItem } from '../../../../shared/modelListApi';
 
 type LlmConfigurationStepProps = {
   onSaved: () => void | Promise<void>;
@@ -40,6 +46,10 @@ function hasUsableApiKey(value: unknown) {
   return Boolean(key) && key !== PLACEHOLDER_API_KEY && key !== MASKED_SECRET && !key.startsWith('PLACEHOLDER_');
 }
 
+function requiresApiKey(provider: CatalogProvider | null) {
+  return provider?.requiresApiKey !== false;
+}
+
 export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepProps) {
   const [selectedProvider, setSelectedProvider] = useState<CatalogProvider | null>(DEFAULT_PROVIDER);
   const [selectedModelId, setSelectedModelId] = useState(() => defaultModelForProvider(DEFAULT_PROVIDER));
@@ -51,13 +61,16 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
   const [testStatus, setTestStatus] = useState<TestStatus>('idle');
   const [testMessage, setTestMessage] = useState('');
   const [saving, setSaving] = useState(false);
+  const [apiModels, setApiModels] = useState<ApiModelListItem[] | null>(null);
+  const [modelListStatus, setModelListStatus] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [modelListMessage, setModelListMessage] = useState('');
 
   // Inputs that are only relevant when the user picks the "+" (custom) tile.
   const [customProviderId, setCustomProviderId] = useState('');
-  const [customProtocol, setCustomProtocol] = useState<'openai' | 'anthropic'>('openai');
+  const [customProtocol, setCustomProtocol] = useState<CatalogProviderProtocol>('openai');
 
   const isCustomMode = selectedProvider?.id === CUSTOM_PROVIDER_ID;
-  const selectedModels = selectedProvider?.models ?? [];
+  const selectedModels = apiModels ?? selectedProvider?.models ?? [];
   const selectedDefaultUrl = selectedProvider?.defaultUrl ?? '';
 
   useEffect(() => {
@@ -85,17 +98,124 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
 
   const effectiveUrl = customUrl.trim() || selectedProvider?.defaultUrl || '';
   const effectiveModelId = customModelId.trim() || selectedModelId;
-  const effectiveProtocol: 'openai' | 'anthropic' = isCustomMode
+  const effectiveProtocol: CatalogProviderProtocol = isCustomMode
     ? customProtocol
     : (selectedProvider?.protocol ?? 'openai');
   const effectiveProviderId = isCustomMode ? customProviderId.trim() : (selectedProvider?.id ?? '');
+  const selectedProviderRequiresApiKey = requiresApiKey(selectedProvider);
+  const modelListRequiresApiKey = selectedProvider?.modelListRequiresApiKey === true;
+  const canFetchModels = Boolean(
+    selectedProvider
+      && effectiveProviderId
+      && effectiveUrl
+      && (!modelListRequiresApiKey || hasUsableApiKey(apiKey)),
+  );
   const canTest = Boolean(
     selectedProvider &&
-    apiKey.trim() &&
+    (!selectedProviderRequiresApiKey || apiKey.trim()) &&
     effectiveModelId &&
     effectiveProviderId &&
     (!isCustomMode || effectiveUrl.trim()),
   );
+
+  useEffect(() => {
+    setApiModels(null);
+    setModelListStatus('idle');
+    setModelListMessage('');
+  }, [effectiveProviderId, effectiveUrl, effectiveProtocol]);
+
+  useEffect(() => {
+    if (!selectedProvider || isCustomMode || apiKey.trim()) return;
+    if (!selectedProviderRequiresApiKey || modelListRequiresApiKey) return;
+    const catalogModels = selectedProvider.models;
+    const controller = new AbortController();
+    setModelListStatus('loading');
+    setModelListMessage('');
+    fetchRemoteDefaultModels(selectedProvider.id)
+      .then((models) => {
+        if (controller.signal.aborted) return;
+        setApiModels(models.length > 0 ? models : catalogModels);
+        setModelListStatus('idle');
+        const nextModels = models.length > 0 ? models : catalogModels;
+        setSelectedModelId((current) => (
+          nextModels.length > 0 && !nextModels.some((model) => model.id === current)
+            ? nextModels[0].id
+            : current
+        ));
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        setApiModels(catalogModels);
+        setModelListStatus('idle');
+        const message = error instanceof Error ? error.message : String(error);
+        setModelListMessage(`Using bundled model list. Remote model list unavailable: ${message}`);
+      });
+    return () => controller.abort();
+  }, [apiKey, isCustomMode, modelListRequiresApiKey, selectedProvider, selectedProviderRequiresApiKey]);
+
+  useEffect(() => {
+    const key = apiKey.trim();
+    if (!selectedProvider || !effectiveProviderId || !effectiveUrl) return;
+    if (!hasUsableApiKey(key) && !isCustomMode && selectedProviderRequiresApiKey) return;
+    const controller = new AbortController();
+    setModelListStatus('loading');
+    setModelListMessage('');
+    fetchProviderModels({ protocol: effectiveProtocol, baseUrl: effectiveUrl, apiKey: hasUsableApiKey(key) ? key : '', providerId: effectiveProviderId })
+      .then((models) => {
+        if (controller.signal.aborted) return;
+        setApiModels(!hasUsableApiKey(key) && models.length === 0 ? selectedProvider.models : models);
+        setModelListStatus('idle');
+        const nextModels = !hasUsableApiKey(key) && models.length === 0 ? selectedProvider.models : models;
+        setSelectedModelId((current) => (
+          nextModels.length > 0 && !nextModels.some((model) => model.id === current)
+            ? nextModels[0].id
+            : current
+        ));
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        if (!selectedProviderRequiresApiKey && selectedProvider.models.length > 0) {
+          setApiModels(selectedProvider.models);
+          setModelListStatus('idle');
+          const message = error instanceof Error ? error.message : String(error);
+          setModelListMessage(`Using bundled model list. Local model list unavailable: ${message}`);
+          return;
+        }
+        setModelListStatus('error');
+        setModelListMessage(error instanceof Error ? error.message : String(error));
+      });
+    return () => controller.abort();
+  }, [apiKey, effectiveProviderId, effectiveProtocol, effectiveUrl, isCustomMode, selectedModelId, selectedProvider, selectedProviderRequiresApiKey]);
+
+  const handleFetchModels = useCallback(async () => {
+    if (!canFetchModels) return;
+    setModelListStatus('loading');
+    setModelListMessage('');
+    try {
+      const key = apiKey.trim();
+      const models = !isCustomMode && !hasUsableApiKey(key)
+        ? await fetchRemoteDefaultModels(effectiveProviderId)
+        : await fetchProviderModels({
+            protocol: effectiveProtocol,
+            baseUrl: effectiveUrl,
+            apiKey: hasUsableApiKey(key) ? key : '',
+            providerId: effectiveProviderId,
+          });
+      const nextModels = !hasUsableApiKey(key) && !isCustomMode && selectedProvider
+        ? (models.length > 0 ? models : selectedProvider.models)
+        : models;
+      setApiModels(nextModels);
+      setModelListStatus('idle');
+      setSelectedModelId((current) => (
+        nextModels.length > 0 && !nextModels.some((model) => model.id === current)
+          ? nextModels[0].id
+          : current
+      ));
+    } catch (error) {
+      setModelListStatus('error');
+      setModelListMessage(error instanceof Error ? error.message : String(error));
+    }
+  }, [apiKey, canFetchModels, effectiveProviderId, effectiveProtocol, effectiveUrl, isCustomMode, selectedProvider]);
 
   const handleProviderSelect = useCallback((provider: CatalogProvider) => {
     setSelectedProvider((prev) => {
@@ -108,6 +228,9 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
       return provider;
     });
     setSelectedModelId(defaultModelForProvider(provider));
+    setApiModels(null);
+    setModelListStatus('idle');
+    setModelListMessage('');
     setCustomModelId('');
     setCustomUrl('');
     setCustomProviderId('');
@@ -125,6 +248,7 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
         method: 'POST',
         body: JSON.stringify({
           providerType: effectiveProtocol,
+          providerId: effectiveProviderId,
           baseUrl: effectiveUrl,
           apiKey: apiKey.trim(),
           model: effectiveModelId,
@@ -142,7 +266,7 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
       setTestStatus('error');
       setTestMessage(err instanceof Error ? err.message : 'Connection failed.');
     }
-  }, [canTest, selectedProvider, effectiveUrl, apiKey, effectiveModelId, effectiveProtocol]);
+  }, [canTest, selectedProvider, effectiveUrl, apiKey, effectiveModelId, effectiveProtocol, effectiveProviderId]);
 
   const handleSave = useCallback(async () => {
     if (!selectedProvider) return;
@@ -227,7 +351,7 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
       <div>
         <h2 className="text-lg font-semibold text-foreground">LLM Provider Setup</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Select your provider and enter your API key. Model capabilities are auto-configured.
+          Select your provider and configure credentials. Model capabilities are auto-configured.
         </p>
       </div>
 
@@ -251,9 +375,6 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
               }`}
             >
               <div className="font-medium">{provider.displayName}</div>
-              <div className="mt-0.5 text-[11px] opacity-60">
-                {provider.models.length} model{provider.models.length === 1 ? '' : 's'}
-              </div>
               {selectedProvider?.id === provider.id && (
                 <Check className="absolute right-2 top-2 h-4 w-4 text-foreground" strokeWidth={2.5} />
               )}
@@ -271,7 +392,7 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
             <Plus className="h-4 w-4" />
             <div>
               <div className="font-medium">Custom</div>
-              <div className="mt-0.5 text-[11px] opacity-60">Any OpenAI / Anthropic endpoint</div>
+              <div className="mt-0.5 text-[11px] opacity-60">OpenAI / Anthropic / Google</div>
             </div>
             {isCustomMode && (
               <Check className="absolute right-2 top-2 h-4 w-4 text-foreground" strokeWidth={2.5} />
@@ -309,11 +430,13 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
                     <select
                       id="custom-protocol"
                       value={customProtocol}
-                      onChange={(e) => { setCustomProtocol(e.target.value as 'openai' | 'anthropic'); setTestStatus('idle'); setTestMessage(''); }}
+                      onChange={(e) => { setCustomProtocol(e.target.value as CatalogProviderProtocol); setTestStatus('idle'); setTestMessage(''); }}
                       className="w-full appearance-none rounded-lg border border-border bg-background px-3 py-2.5 pr-8 text-sm text-foreground focus:border-foreground/40 focus:outline-none"
                     >
                       <option value="openai">openai</option>
+                      <option value="openai-responses">openai-responses</option>
                       <option value="anthropic">anthropic</option>
+                      <option value="google">google</option>
                     </select>
                     <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                   </div>
@@ -337,6 +460,16 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
                     OpenAI-compatible base URLs should include the API version path, for example ending in <span className="font-mono">/v1</span>.
                   </p>
                 )}
+                {customProtocol === 'openai-responses' && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    OpenAI Responses API base URLs should include the API version path, for example ending in <span className="font-mono">/v1</span>.
+                  </p>
+                )}
+                {customProtocol === 'google' && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Native Google Gemini uses <span className="font-mono">https://generativelanguage.googleapis.com</span> unless you need a custom endpoint.
+                  </p>
+                )}
                 </div>
               </div>
             </div>
@@ -345,14 +478,14 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
           {/* API Key */}
           <div>
             <label htmlFor="llm-api-key" className="mb-1 block text-sm font-medium text-foreground">
-              API Key
+              API Key{selectedProviderRequiresApiKey ? '' : ' (optional)'}
             </label>
             <input
               id="llm-api-key"
               type="password"
               value={apiKey}
               onChange={(e) => { setApiKey(e.target.value); setTestStatus('idle'); setTestMessage(''); }}
-              placeholder="sk-..."
+              placeholder={selectedProviderRequiresApiKey ? 'sk-...' : 'Not required for this provider'}
               className="w-full rounded-lg border border-border bg-background px-3 py-2.5 font-mono text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/40 focus:outline-none"
               autoComplete="off"
               spellCheck={false}
@@ -389,6 +522,27 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
                 autoComplete="off"
                 spellCheck={false}
               />
+            )}
+            {modelListStatus === 'loading' && (
+              <p className="mt-1 inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+                <Loader2 className="h-3 w-3 animate-spin" /> Fetching remote model list...
+              </p>
+            )}
+            {selectedProvider && (
+              <button
+                type="button"
+                onClick={handleFetchModels}
+                disabled={!canFetchModels || modelListStatus === 'loading'}
+                className="mt-2 text-xs text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Fetch model list
+              </button>
+            )}
+            {modelListStatus === 'error' && modelListMessage && (
+              <p className="mt-1 text-[11px] text-destructive">{modelListMessage}</p>
+            )}
+            {modelListStatus === 'idle' && modelListMessage && (
+              <p className="mt-1 text-[11px] text-muted-foreground">{modelListMessage}</p>
             )}
             {selectedModels.length > 0 && (
               <div className="mt-2">
@@ -434,6 +588,16 @@ export default function LlmConfigurationStep({ onSaved }: LlmConfigurationStepPr
                   {(selectedProvider?.protocol ?? customProtocol) === 'openai' && (
                     <p className="mt-1 text-[11px] text-muted-foreground">
                       OpenAI-compatible base URLs should include the API version path, for example ending in <span className="font-mono">/v1</span>.
+                    </p>
+                  )}
+                  {(selectedProvider?.protocol ?? customProtocol) === 'openai-responses' && (
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      OpenAI Responses API base URLs should include the API version path, for example ending in <span className="font-mono">/v1</span>.
+                    </p>
+                  )}
+                  {(selectedProvider?.protocol ?? customProtocol) === 'google' && (
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      Native Google Gemini uses <span className="font-mono">https://generativelanguage.googleapis.com</span>.
                     </p>
                   )}
                 </div>

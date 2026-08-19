@@ -18,11 +18,15 @@ export type GatewayWsNotificationHandler = (name: string, payload: unknown) => v
  */
 export class GatewayRequestError extends Error {
   public readonly validation?: unknown;
-  constructor(public readonly code: string, message: string, extra?: { validation?: unknown }) {
+  public readonly details?: unknown;
+  constructor(public readonly code: string, message: string, extra?: { validation?: unknown; details?: unknown }) {
     super(message);
     this.name = "GatewayRequestError";
     if (extra?.validation !== undefined) {
       this.validation = extra.validation;
+    }
+    if (extra?.details !== undefined) {
+      this.details = extra.details;
     }
   }
 }
@@ -70,13 +74,33 @@ export class GatewayWsClient {
     );
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Gateway hello timed out.")), 5000);
-      const onHello = () => {
-        if (this.hello) {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error("Gateway hello timed out."));
+        }
+      }, 10_000);
+
+      const onClose = (event: CloseEvent) => {
+        if (!settled) {
+          settled = true;
           clearTimeout(timeout);
+          const reason = event.reason || `code ${event.code}`;
+          reject(new Error(`Gateway closed during hello: ${reason}`));
+        }
+      };
+      ws.addEventListener("close", onClose, { once: true });
+
+      const onHello = () => {
+        if (settled) return;
+        if (this.hello) {
+          settled = true;
+          clearTimeout(timeout);
+          ws.removeEventListener("close", onClose);
           resolve(this.hello);
         } else {
-          setTimeout(onHello, 0);
+          setTimeout(onHello, 50);
         }
       };
       onHello();
@@ -138,12 +162,14 @@ export class GatewayWsClient {
         // payload (e.g. `validation` for SkillValidationError) so
         // hosts can route on a stable identifier instead of parsing
         // the message string.
-        const envelope = frame.error as { code?: string; message?: string; validation?: unknown };
+        const envelope = frame.error as { code?: string; message?: string; validation?: unknown; details?: unknown };
         pending.reject(
           new GatewayRequestError(
             envelope.code ?? "gateway_request_failed",
             envelope.message ?? "Gateway request failed.",
-            envelope.validation !== undefined ? { validation: envelope.validation } : undefined,
+            envelope.validation !== undefined || envelope.details !== undefined
+              ? { validation: envelope.validation, details: envelope.details }
+              : undefined,
           ),
         );
       }

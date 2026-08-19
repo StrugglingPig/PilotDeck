@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMatch, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import ReactDOM from 'react-dom';
@@ -7,7 +7,7 @@ import { useWebSocket } from '../../contexts/WebSocketContext';
 import { useDeviceSettings } from '../../hooks/useDeviceSettings';
 import { useSessionProtection } from '../../hooks/useSessionProtection';
 import { useProjectsState } from '../../hooks/useProjectsState';
-import Settings from '../settings/view/Settings';
+import Settings from '../settings/Settings';
 import ProjectCreationWizard from '../project-creation-wizard';
 import { normalizeProjectForSettings, type SettingsProject } from '../../lib/projectSettings';
 import {
@@ -23,8 +23,12 @@ import {
   type SessionProvider,
 } from '../../types/app';
 import { api } from '../../utils/api';
+import { resolveMarkdownFileHref } from '../chat/utils/resolveMarkdownFileHref';
+import type { SessionNavigationOptions } from '../main-content/types/types';
 import SidebarV2 from './SidebarV2';
 import MainAreaV2 from './MainAreaV2';
+import { chooseDefaultProject } from './appShellSelection';
+import { ConnectionBanner } from '../ui/ConnectionBanner';
 
 type TypedSettingsProps = {
   isOpen: boolean;
@@ -149,6 +153,24 @@ export default function AppShellV2() {
     activeSessions,
   });
 
+  const misroutedFileFromUrl = useMemo(() => {
+    if (!sessionId) return null;
+    const filePath = resolveMarkdownFileHref(`/session/${sessionId}`);
+    if (!filePath) return null;
+    if (isLoadingProjects) return filePath;
+    const hasMatchingSession = sidebarSharedProps.projects.some((project) =>
+      (project.sessions ?? []).some((session) => session.id === sessionId),
+    );
+    return hasMatchingSession ? null : filePath;
+  }, [sessionId, isLoadingProjects, sidebarSharedProps.projects]);
+
+  const handleMisroutedFileUrlHandled = useCallback(() => {
+    const target = selectedProject
+      ? `/p/${encodeURIComponent(selectedProject.name)}`
+      : '/';
+    navigate(target, { replace: true });
+  }, [navigate, selectedProject]);
+
   // Sync URL projectName -> selectedProject for deep links like /p/:projectName.
   // When the URL also carries a session id (/p/.../c/:sessionId or
   // /session/:sessionId) we let useProjectsState own the resolution because
@@ -173,10 +195,9 @@ export default function AppShellV2() {
     navigate,
   ]);
 
-  // Default selection: prefer a project named "general" so the project-centric
-  // sidebar always has something useful surfaced. Falls back to the first
-  // project when "general" is missing. Runs only when there's no URL hint and
-  // no current selection — never overrides user navigation.
+  // Default selection: prefer a regular project. General is only the fallback
+  // when no regular project exists. Explicit project/session URLs still own
+  // selection and are never overridden here.
   const didDefaultProjectRef = useRef(false);
   useEffect(() => {
     if (didDefaultProjectRef.current) return;
@@ -189,11 +210,8 @@ export default function AppShellV2() {
       didDefaultProjectRef.current = true;
       return;
     }
-    if (sidebarSharedProps.projects.length === 0) return;
-    const general = sidebarSharedProps.projects.find(
-      (p) => p.name === 'general' || p.displayName === 'general',
-    );
-    const target = general ?? sidebarSharedProps.projects[0];
+    const target = chooseDefaultProject(sidebarSharedProps.projects);
+    if (!target) return;
     handleProjectSelect(target);
     navigate(`/p/${encodeURIComponent(target.name)}`, { replace: true });
     didDefaultProjectRef.current = true;
@@ -353,7 +371,15 @@ export default function AppShellV2() {
       setDesktopSidebarOpen(false);
     }
   }, [isMobile, setSidebarOpen]);
-  const onOpenDesktopSidebar = useCallback(() => setDesktopSidebarOpen(true), []);
+  const onOpenDesktopSidebar = useCallback(() => {
+    setDesktopSidebarOpen(true);
+  }, []);
+
+  useEffect(() => {
+    if (!isMobile && activeTab === 'files') {
+      setDesktopSidebarOpen(true);
+    }
+  }, [activeTab, isMobile]);
 
   // Project creation wizard (local existing / new local / github clone). The
   // sidebar's Projects-section "+" opens this; row-level "+" is for new sessions.
@@ -473,7 +499,12 @@ export default function AppShellV2() {
   );
 
   const handleSelectSession = useCallback(
-    (project: Project, sessId: string, fallbackSession?: ProjectSession) => {
+    (
+      project: Project,
+      sessId: string,
+      fallbackSession?: ProjectSession,
+      options?: SessionNavigationOptions,
+    ) => {
       setUnreadSessionIds((previous) => {
         if (!previous.has(sessId)) return previous;
         const next = new Set(previous);
@@ -485,13 +516,15 @@ export default function AppShellV2() {
       }
       const target = (project.sessions ?? []).find((s) => s.id === sessId);
       if (target) {
-        handleSessionSelect(target);
+        handleSessionSelect(fallbackSession ? { ...target, ...fallbackSession } : target);
       } else if (fallbackSession) {
         handleSessionSelect(fallbackSession);
       } else {
         navigate(`/session/${sessId}`);
       }
-      setActiveTab('chat');
+      if (!options?.preserveActiveTab) {
+        setActiveTab('chat');
+      }
     },
     [handleProjectSelect, handleSessionSelect, navigate, selectedProject?.name, setActiveTab],
   );
@@ -517,14 +550,14 @@ export default function AppShellV2() {
   );
 
   const handleStartNewSession = useCallback(
-    (project: Project | null) => {
+    (project: Project | null, options?: SessionNavigationOptions) => {
       if (project) {
         handleNewSession(project);
         navigate(`/p/${encodeURIComponent(project.name)}`);
-        setActiveTab('chat');
+        setActiveTab(options?.preserveActiveTab ? 'files' : 'chat');
       } else if (selectedProject) {
         handleNewSession(selectedProject);
-        setActiveTab('chat');
+        setActiveTab(options?.preserveActiveTab ? 'files' : 'chat');
       } else {
         // No project context yet — land on /, MainContent's empty state
         // will prompt the user to create or pick a project.
@@ -581,7 +614,9 @@ export default function AppShellV2() {
   );
 
   return (
-    <div className="ui-v2 fixed inset-0 flex bg-white font-sans text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+    <div className="ui-v2 fixed inset-0 flex flex-col bg-white font-sans text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+      <ConnectionBanner />
+      <div className="flex min-h-0 flex-1">
       {!isMobile ? (
         desktopSidebarOpen ? sidebar : null
       ) : (
@@ -607,7 +642,7 @@ export default function AppShellV2() {
         </div>
       )}
 
-      <main className="flex min-w-0 flex-1 flex-col">
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
         <MainAreaV2
           projects={sidebarSharedProps.projects}
           selectedProject={selectedProject}
@@ -627,12 +662,13 @@ export default function AppShellV2() {
           onSessionNotProcessing={markSessionAsNotProcessing}
           onSessionActivityBump={bumpSessionActivity}
           processingSessions={processingSessions}
+          unreadSessionIds={unreadSessionIds}
           onReplaceTemporarySession={handleReplaceTemporarySession}
           onNavigateToSession={(sid: string) => {
             setSelectedSession((prev) => prev?.id === sid ? prev : { id: sid } as ProjectSession);
             navigate(`/session/${sid}`);
           }}
-          onStartNewSession={handleNewSession}
+          onStartNewSession={handleStartNewSession}
           onSelectSession={handleSelectSession}
           onShowSettings={onShowSettings}
           onSelectProjectByName={(name: string) => {
@@ -647,6 +683,8 @@ export default function AppShellV2() {
           isSidebarCollapsed={!isMobile && !desktopSidebarOpen}
           onOpenSidebar={onOpenDesktopSidebar}
           externalMessageUpdate={externalMessageUpdate}
+          misroutedFileFromUrl={misroutedFileFromUrl}
+          onMisroutedFileUrlHandled={handleMisroutedFileUrlHandled}
         />
       </main>
 
@@ -697,6 +735,7 @@ export default function AppShellV2() {
 	            document.body,
 	          )
 	        : null}
+	    </div>
 	    </div>
 	  );
 	}
@@ -819,7 +858,7 @@ function DeleteSessionDialog({
           <p className="text-sm text-foreground">
             This removes the conversation from <span className="font-medium">{projectName}</span>.
           </p>
-          
+
           {error ? (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               {error}

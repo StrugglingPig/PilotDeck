@@ -1,4 +1,6 @@
 import type { AgentTurnResult } from "../../agent/index.js";
+import type { AgentStatusMessageInput } from "../../session/transcript/TranscriptWriter.js";
+import type { AgentRunMode } from "../../agent/protocol/input.js";
 import type {
   CronCreateInput,
   CronCreateResult,
@@ -10,8 +12,11 @@ import type {
   CronRunNowResult,
   CronStopInput,
   CronStopResult,
+  CronUpdateInput,
+  CronUpdateResult,
 } from "../../cron/protocol/types.js";
 import type { CanonicalUsage } from "../../model/index.js";
+import type { TelemetryExecutionKind, TelemetryModule } from "../../telemetry/index.js";
 import type { SessionInfo as ProjectSessionInfo } from "../../session/index.js";
 import type {
   PilotDeckElicitationAnswer,
@@ -22,6 +27,10 @@ import type {
   WebProjectSummary as WebUiProjectSummary,
   WebReadSessionMessagesInput as WebUiReadSessionMessagesInput,
   WebReadSessionMessagesResult as WebUiReadSessionMessagesResult,
+  WebReadSubagentMessagesInput as WebUiReadSubagentMessagesInput,
+  WebReadSubagentMessagesResult as WebUiReadSubagentMessagesResult,
+  WebForkSessionInput as WebUiForkSessionInput,
+  WebForkSessionResult as WebUiForkSessionResult,
 } from "../../web/client/protocol.js";
 import type {
   SkillCreateInput,
@@ -51,7 +60,7 @@ export type GatewayChannelKey =
   | "api_server" | "webhook"
   | (string & {});
 
-export type GatewayMode = "default" | "plan" | "acceptEdits" | "bypassPermissions";
+export type GatewayMode = "default" | "plan" | "bypassPermissions";
 
 export type ChannelAttachment = {
   type: "file" | "image" | "text" | "unknown";
@@ -60,6 +69,17 @@ export type ChannelAttachment = {
   mimeType?: string;
   content?: string;
   bytes?: number;
+  metadata?: Record<string, unknown>;
+};
+
+export type GatewayOutboundAttachment = {
+  type: "file" | "image" | "text" | "unknown";
+  name?: string;
+  path?: string;
+  mimeType?: string;
+  content?: string;
+  bytes?: number;
+  source: "tool_result" | "media_reference" | "local_path";
   metadata?: Record<string, unknown>;
 };
 
@@ -73,14 +93,67 @@ export type GatewaySubmitTurnInput = {
   /** Override the agent session's working directory for this session. */
   workspaceCwd?: string;
   attachments?: ChannelAttachment[];
+  uploadedAttachments?: UploadedAttachmentRef[];
+  /** A one-turn model override. Persisted session preferences are managed separately. */
+  modelOverride?: ExplicitModelSelection;
+  runMode?: AgentRunMode;
   mode?: GatewayMode;
+  /** The user's actual permission preference before plan-mode override. */
+  basePermissionMode?: GatewayMode;
+  /** Allow model-visible plan mode tools for this turn. Defaults to true only for explicit plan-mode turns. */
+  allowPlanModeTools?: boolean;
+  /**
+   * Whether the submitting host can answer mid-turn user prompts such as
+   * permission requests or ask_user_question elicitation. Headless CLI runs
+   * set this false so the agent avoids tools that would otherwise hang.
+   */
+  canPrompt?: boolean;
   runId?: string;
   maxTurns?: number;
+  /** Hard wall-clock limit for this turn. The gateway aborts and closes the session when exceeded. */
+  timeoutMs?: number;
+  telemetry?: {
+    ownerModule?: TelemetryModule;
+    executionKind?: TelemetryExecutionKind;
+    phase?: string;
+  };
+  /**
+   * Channel-specific synthetic messages appended to the turn input.
+   * These are stored in the transcript with `metadata.synthetic: true`
+   * so they are visible to the model but hidden from the Web UI.
+   */
+  syntheticMessages?: Array<{ text: string; purpose?: string }>;
 };
 
-export type GatewayEvent =
+export type GatewayRecordAgentStatusMessageInput = {
+  sessionKey: string;
+  turnId: string;
+  projectKey?: string;
+  status: AgentStatusMessageInput;
+};
+
+type GatewayTurnScopedEventMetadata = {
+  /**
+   * Stable id of the active turn that produced this event. Turn-scoped events
+   * carry it so streaming clients can match deltas with lifecycle boundaries.
+   */
+  runId?: string;
+};
+
+export type GatewayEvent = GatewayTurnScopedEventMetadata & (
   | { type: "turn_started"; runId: string }
+  | { type: "model_request_started"; model?: string; provider?: string }
+  | {
+      type: "model_selection_changed";
+      provider: string;
+      model: string;
+      source: "turn" | "session" | "router" | "default";
+      reasoning?: number;
+      temperature?: number;
+    }
   | { type: "assistant_text_delta"; text: string }
+  | { type: "assistant_attachment"; attachment: GatewayOutboundAttachment }
+  | { type: "file_artifacts"; artifacts: import("../../session/artifacts/FileArtifact.js").FileArtifact[] }
   | { type: "assistant_thinking_delta"; text: string }
   | { type: "tool_call_started"; toolCallId: string; name: string; argsPreview?: string }
   | {
@@ -148,16 +221,37 @@ export type GatewayEvent =
   | {
       type: "context_budget";
       used: number;
+      displayUsed?: number;
+      budgetUsed?: number;
       total: number;
+      effectiveTotal?: number;
+      reservedOutputTokens?: number;
       ratio: number;
       state: "ok" | "warning" | "blocking";
     }
   | { type: "turn_completed"; usage: TurnUsage; finishReason: AgentTurnResult["stopReason"] | string }
   | { type: "agent_status"; event: string; detail?: Record<string, unknown> }
-  | { type: "error"; message: string; code?: string; recoverable: boolean };
+  | {
+      type: "error";
+      message: string;
+      code?: string;
+      recoverable: boolean;
+      userHint?: string;
+      providerError?: {
+        provider?: string;
+        protocol?: string;
+        status?: number;
+        code?: string;
+        message?: string;
+        raw?: string;
+      };
+    }
+);
 
 export type GatewayActiveTurnSnapshotInput = {
   sessionKey: string;
+  /** Defaults to true. Set false for status-only polling. */
+  includeEvents?: boolean;
 };
 
 export type GatewayActiveTurnSnapshot = {
@@ -205,6 +299,10 @@ export type GatewaySessionPermissionGrantInput = {
 
 export type WebReadSessionMessagesInput = WebUiReadSessionMessagesInput;
 export type WebReadSessionMessagesResult = WebUiReadSessionMessagesResult;
+export type WebReadSubagentMessagesInput = WebUiReadSubagentMessagesInput;
+export type WebReadSubagentMessagesResult = WebUiReadSubagentMessagesResult;
+export type WebForkSessionInput = WebUiForkSessionInput;
+export type WebForkSessionResult = WebUiForkSessionResult;
 export type WebProjectSummary = WebUiProjectSummary;
 export type WebListProjectsResult = WebUiListProjectsResult;
 export type WebDescribeProjectInput = { projectKey: string };
@@ -241,11 +339,138 @@ export type GatewayServerInfo = {
   protocolVersion?: string;
   projectKey?: string;
   sessionCount?: number;
+  capabilities?: GatewayCapability[];
+};
+
+export type GatewayCapability =
+  | "project_files_list"
+  | "commands_list"
+  | "model_catalog_list"
+  | "session_model_get"
+  | "session_model_set"
+  | "session_model_clear";
+
+export type MatchRange = {
+  field: string;
+  start: number;
+  end: number;
+};
+
+export type ProjectFileEntry = {
+  id: string;
+  name: string;
+  relativePath: string;
+  kind: "file" | "directory";
+  size: number;
+  mtimeMs: number;
+  matches?: MatchRange[];
+};
+
+export type ProjectFilesListInput = {
+  projectKey: string;
+  query?: string;
+  cursor?: string;
+  limit?: number;
+  includeDirs?: boolean;
+};
+
+export type ProjectFilesListResult = {
+  items: ProjectFileEntry[];
+  nextCursor?: string;
+  projectKey: string;
+};
+
+export type CommandListItem = {
+  name: string;
+  description?: string;
+  namespace: string;
+  type: string;
+  argumentHint?: string;
+  path?: string;
+  relativePath?: string;
+  metadata?: Record<string, unknown>;
+  matches?: MatchRange[];
+};
+
+export type CommandsListInput = {
+  projectKey: string;
+  query?: string;
+  cursor?: string;
+  limit?: number;
+};
+
+export type CommandsListResult = {
+  pinned: CommandListItem[];
+  builtIn: CommandListItem[];
+  custom: CommandListItem[];
+  nextCursor?: string;
+};
+
+export type ModelNumericCapability = {
+  type: "range" | "enum";
+  min?: number;
+  max?: number;
+  step?: number;
+  values?: number[];
+  default?: number;
+};
+
+export type ModelCatalogItem = {
+  id: string;
+  provider: string;
+  model: string;
+  displayName: string;
+  available: boolean;
+  capabilities: {
+    reasoning?: ModelNumericCapability;
+    temperature?: ModelNumericCapability;
+  };
+};
+
+export type ModelCatalogListInput = {
+  projectKey: string;
+  query?: string;
+  provider?: string;
+  includeAuto?: boolean;
+};
+
+export type ModelCatalogListResult = {
+  items: ModelCatalogItem[];
+  router: { enabled: boolean; autoAvailable: boolean };
+};
+
+export type ExplicitModelSelection = {
+  mode: "model";
+  provider: string;
+  model: string;
+  reasoning?: number;
+  temperature?: number;
+};
+
+export type SessionModelSelection = { mode: "auto" } | ExplicitModelSelection;
+
+export type SessionModelInput = { sessionKey: string; projectKey: string };
+export type SessionModelSetInput = SessionModelInput & { selection: SessionModelSelection };
+export type SessionModelResult = SessionModelInput & {
+  saved?: SessionModelSelection;
+  effective: {
+    provider: string;
+    model: string;
+    source: "session" | "router" | "default";
+    reasoning?: number;
+    temperature?: number;
+  };
+};
+
+export type UploadedAttachmentRef = {
+  uploadId: string;
+  attachmentIds?: string[];
 };
 
 export type GatewayCronController = {
   createTask(input: CronCreateInput): Promise<CronCreateResult>;
   listTasks(input: CronListInput): Promise<CronListResult>;
+  updateTask(input: CronUpdateInput): Promise<CronUpdateResult>;
   deleteTask(input: CronDeleteInput): Promise<CronDeleteResult>;
   stopTask(input: CronStopInput): Promise<CronStopResult>;
   runTaskNow(input: CronRunNowInput): Promise<CronRunNowResult>;
@@ -254,6 +479,13 @@ export type GatewayCronController = {
 export type ReloadConfigResult = {
   reloaded: boolean;
   changedPaths?: string[];
+  reason?: "unsupported" | "unchanged";
+};
+
+export type PrepareWeixinLoginResult = {
+  requested: boolean;
+  requestedAt: string;
+  reason?: "unsupported";
 };
 
 export type ReloadExtensionsInput = {
@@ -264,6 +496,7 @@ export type ReloadExtensionsInput = {
 export type ReloadExtensionsResult = {
   reloaded: boolean;
   changedPaths?: string[];
+  reason?: "unsupported" | "unchanged";
 };
 
 export type AlwaysOnApplyInput = {
@@ -290,15 +523,23 @@ export type AlwaysOnRerunPlanResult = {
 
 export interface Gateway {
   submitTurn(input: GatewaySubmitTurnInput): AsyncIterable<GatewayEvent>;
-  abortTurn(input: { sessionKey: string; runId?: string }): Promise<void>;
+  abortTurn(input: { sessionKey: string; runId?: string; reason?: string }): Promise<void>;
   listSessions(input: ListSessionsInput): Promise<ListSessionsResult>;
   resumeSession(input: { sessionKey: string }): Promise<{ sessionKey: string }>;
   newSession(input: NewSessionInput): Promise<{ sessionKey: string }>;
   closeSession(input: { sessionKey: string; reason?: string }): Promise<void>;
+  recordAgentStatusMessage?(input: GatewayRecordAgentStatusMessageInput): Promise<{ recorded: boolean }>;
   describeServer(): Promise<GatewayServerInfo>;
+  projectFilesList?(input: ProjectFilesListInput): Promise<ProjectFilesListResult>;
+  commandsList?(input: CommandsListInput): Promise<CommandsListResult>;
+  modelCatalogList?(input: ModelCatalogListInput): Promise<ModelCatalogListResult>;
+  sessionModelGet?(input: SessionModelInput): Promise<SessionModelResult>;
+  sessionModelSet?(input: SessionModelSetInput): Promise<SessionModelResult>;
+  sessionModelClear?(input: SessionModelInput): Promise<void>;
   getActiveTurnSnapshot?(input: GatewayActiveTurnSnapshotInput): Promise<GatewayActiveTurnSnapshot>;
   cronCreate(input: CronCreateInput): Promise<CronCreateResult>;
   cronList(input: CronListInput): Promise<CronListResult>;
+  cronUpdate(input: CronUpdateInput): Promise<CronUpdateResult>;
   cronDelete(input: CronDeleteInput): Promise<CronDeleteResult>;
   cronStop(input: CronStopInput): Promise<CronStopResult>;
   cronRunNow(input: CronRunNowInput): Promise<CronRunNowResult>;
@@ -327,6 +568,14 @@ export interface Gateway {
    */
   readSessionMessages(input: WebReadSessionMessagesInput): Promise<WebReadSessionMessagesResult>;
   /**
+   * Fork a session transcript at a prior user turn into a new session file.
+   */
+  forkSession(input: WebForkSessionInput): Promise<WebForkSessionResult>;
+  /**
+   * Read a subagent's sidechain transcript and return its messages in WebMessage format.
+   */
+  readSubagentMessages(input: WebReadSubagentMessagesInput): Promise<WebReadSubagentMessagesResult>;
+  /**
    * Web Phase 3 — enumerate projects from PilotDeck home + an optional
    * registry.
    */
@@ -347,6 +596,13 @@ export interface Gateway {
   reloadConfig?(): Promise<ReloadConfigResult>;
 
   /**
+   * Ask the gateway host to start or restart the Weixin channel so it can
+   * generate a runtime QR code. The host owns channel construction; UI/server
+   * callers must not invoke `weixin-ilink.loginWithQR()` directly.
+   */
+  prepareWeixinLogin?(): Promise<PrepareWeixinLoginResult>;
+
+  /**
    * Trigger a plugin/skill/MCP extension reload without waiting for the file
    * watcher. Used by UI config writers that already know an extension-backed
    * file changed (for example `mcp.json`).
@@ -355,8 +611,8 @@ export interface Gateway {
 
   /**
    * Skill-management RPCs. The gateway is the authoritative owner of
-   * `~/.pilotdeck/skills/` (user scope) and `<project>/.pilotdeck/skills/`
-   * (project scope). The Web UI's REST endpoints under `/api/skills/*`
+   * bundled read-only skills, `~/.pilotdeck/skills/` (user scope), and
+   * `<project>/.pilotdeck/skills/` (project scope). The Web UI's REST endpoints under `/api/skills/*`
    * are now thin shims that forward here, so a skill the agent loads
    * and a skill the UI shows always come from the same place.
    *

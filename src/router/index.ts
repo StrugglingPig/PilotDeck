@@ -20,6 +20,7 @@ export type {
   RouterEventBus,
   RouterExecuteFailedEvent,
   RouterFallbackEvent,
+  RouterRetryProgressEvent,
   RouterTokenSaverFailedEvent,
   RouterZeroUsageRetryEvent,
 } from "./protocol/events.js";
@@ -58,6 +59,7 @@ export {
   classifyAndRoute,
   type ClassifyAndRouteInput,
   type TokenSaverDecision,
+  type TokenSaverFailure,
 } from "./tokenSaver/classifyAndRoute.js";
 export {
   applyOrchestration,
@@ -71,3 +73,7 @@ export {
   type CustomRouterRegistry,
   type PilotDeckCustomRouter,
 } from "./customRouter/customRouter.js";
+export {
+  ProviderHealthTracker,
+  type ProviderHealthState,
+} from "./health/ProviderHealthTracker.js";

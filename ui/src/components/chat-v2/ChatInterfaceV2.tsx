@@ -1,18 +1,25 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { MessageSquare } from 'lucide-react';
 import { useTasksSettings } from '../../contexts/TasksSettingsContext';
-import type { ChatInterfaceProps, ChatRunMode, Provider } from '../chat/types/types';
+import { useToast } from '../../contexts/ToastContext';
+import { api } from '../../utils/api';
+import type { ChatInterfaceProps, ChatMessage, ChatRunMode, Provider } from '../chat/types/types';
 import {
   getSessionRequestParams,
-  isBackgroundTaskSession,
+  isReadOnlySession,
 } from '../../types/app';
 import { useChatProviderState } from '../chat/hooks/useChatProviderState';
 import { useChatSessionState } from '../chat/hooks/useChatSessionState';
 import { useChatRealtimeHandlers } from '../chat/hooks/useChatRealtimeHandlers';
 import { useChatComposerState } from '../chat/hooks/useChatComposerState';
+import { getThinkingModeAvailability } from '../chat/constants/thinkingModeAvailability';
 import { useSessionStore } from '../../stores/useSessionStore';
+import { getDraftInputStorageKey, safeLocalStorage } from '../chat/utils/chatStorage';
+import { useSessionWatch } from '../../hooks/useSessionWatch';
 import MessagesPaneV2 from './MessagesPaneV2';
 import ComposerV2 from './ComposerV2';
+import { buildReconnectStatusMessage, refreshSessionAfterReconnect, shouldRefreshSessionOnReconnect } from './reconnectRecovery';
 
 type PendingViewSession = {
   sessionId: string | null;
@@ -31,6 +38,7 @@ function ChatInterfaceV2({
   selectedSession,
   ws,
   sendMessage,
+  subscribe,
   // latestMessage is intentionally not consumed here — useChatRealtimeHandlers
   // now subscribes to the WebSocket directly so React 18 state batching can't
   // drop intermediate stream_delta events.
@@ -48,16 +56,18 @@ function ChatInterfaceV2({
   autoExpandTools,
   showRawParameters,
   showThinking,
+  inlineThinking,
   autoScrollToBottom,
   sendByCtrlEnter,
   externalMessageUpdate,
   forceWelcome,
   onExitWelcome,
+  compact = false,
 }: ChatInterfaceProps) {
   const { t } = useTranslation('chat');
   const { tasksEnabled: _tasksEnabled, isTaskMasterInstalled: _isTaskMasterInstalled } =
     useTasksSettings();
-  const isReadOnlyBackgroundSession = isBackgroundTaskSession(selectedSession);
+  const sessionIsReadOnly = isReadOnlySession(selectedSession);
   const sessionRequestParams = React.useMemo(
     () => getSessionRequestParams(selectedSession),
     [selectedSession],
@@ -70,6 +80,8 @@ function ChatInterfaceV2({
   const pendingViewSessionRef = useRef<PendingViewSession | null>(null);
   const [isAbortPending, setIsAbortPending] = useState(false);
   const [runMode, setRunMode] = useState<ChatRunMode>('agent');
+  const [isForkPending, setIsForkPending] = useState(false);
+  const { addToast } = useToast();
 
   const resetStreamingState = useCallback(() => {
     if (streamTimerRef.current) {
@@ -84,12 +96,22 @@ function ChatInterfaceV2({
     model,
     permissionMode,
     setPermissionMode: setPermissionModeRaw,
+    thinkingModelContext,
     pendingPermissionRequests,
     setPendingPermissionRequests,
   } = useChatProviderState({ selectedSession });
 
+  const thinkingModeAvailability = React.useMemo(
+    () => getThinkingModeAvailability(thinkingModelContext),
+    [thinkingModelContext],
+  );
+
   const cycleRunMode = useCallback(() => {
-    setRunMode((currentMode) => (currentMode === 'plan' ? 'agent' : 'plan'));
+    setRunMode((currentMode) => {
+      if (currentMode === 'agent') return 'plan';
+      if (currentMode === 'plan') return 'ask';
+      return 'agent';
+    });
   }, []);
 
   const selectPermissionMode = useCallback((mode: typeof permissionMode) => {
@@ -111,6 +133,10 @@ function ChatInterfaceV2({
     rewindMessages,
     isLoading,
     setIsLoading,
+    sessionRuntimeState,
+    setSessionRuntimeState,
+    activeRunId,
+    setActiveRunId,
     currentSessionId,
     setCurrentSessionId,
     isLoadingSessionMessages,
@@ -152,14 +178,17 @@ function ChatInterfaceV2({
     sessionStore,
   });
 
+  const watchedSessionId = selectedSession?.id || currentSessionId || null;
+  useSessionWatch({ sessionId: watchedSessionId, ws, sendMessage });
+
   const {
     input,
     setInput,
     textareaRef,
     inputHighlightRef,
     isTextareaExpanded: _isTextareaExpanded,
-    thinkingMode: _thinkingMode,
-    setThinkingMode: _setThinkingMode,
+    thinkingMode,
+    setThinkingMode,
     slashCommandsCount: _slashCommandsCount,
     filteredCommands,
     frequentCommands,
@@ -177,6 +206,8 @@ function ChatInterfaceV2({
     selectFile,
     attachedImages,
     setAttachedImages,
+    documentReferences,
+    removeDocumentReference,
     uploadingImages,
     imageErrors,
     getRootProps,
@@ -196,17 +227,24 @@ function ChatInterfaceV2({
     handleGrantToolPermission,
     handleGrantSessionToolPermission,
     handleInputFocusChange,
+    isBusySendQueued,
+    isBusySendConfirmed,
+    cancelBusySendQueue,
   } = useChatComposerState({
     selectedProject,
     selectedSession,
     currentSessionId,
     model,
+    runMode,
     permissionMode: effectivePermissionMode,
+    basePermissionMode: permissionMode,
     cycleRunMode,
     isLoading,
     canAbortSession,
     tokenBudget,
+    thinkingModeAvailability,
     sendMessage,
+    subscribe,
     sendByCtrlEnter,
     onSessionActive,
     onSessionProcessing,
@@ -227,6 +265,9 @@ function ChatInterfaceV2({
     setIsUserScrolledUp,
     pendingPermissionRequests,
     setPendingPermissionRequests,
+    referenceOnlyPrompt: t('documentReferences.defaultPrompt', {
+      defaultValue: 'Please answer based on the document selection I quoted.',
+    }) as string,
   });
 
   const handlePlanExecutionApproved = useCallback(() => {
@@ -245,21 +286,27 @@ function ChatInterfaceV2({
     accumulatedStreamRef.current = '';
     streamBufferRef.current = '';
 
-    await sessionStore.refreshFromServer(selectedSession.id, {
-      provider: 'pilotdeck',
-      projectName: selectedProject.name,
-      projectPath: selectedProject.fullPath || selectedProject.path || '',
-      ...sessionRequestParams,
-    });
+    if (shouldRefreshSessionOnReconnect({ isLoading, processingSessions, sessionId: selectedSession.id })) {
+      await refreshSessionAfterReconnect(() =>
+        sessionStore.refreshFromServer(selectedSession.id, {
+          provider: 'pilotdeck',
+          projectName: selectedProject.name,
+          projectPath: selectedProject.fullPath || selectedProject.path || '',
+          ...sessionRequestParams,
+        }),
+      );
+    }
 
     // Ask the backend whether the session is still processing so the
-    // loading indicator and Stop button reflect reality after reconnect.
-    sendMessage({
-      type: 'check-session-status',
-      sessionId: selectedSession.id,
-      provider: 'pilotdeck',
-    });
+    // loading indicator, Stop button, and active turn replay reflect reality
+    // after reconnect. The session-status handler consumes activeTurnMessages
+    // and dedupes replay chunks against existing realtime state.
+    const statusMessage = buildReconnectStatusMessage(selectedSession.id, activeRunId);
+    if (statusMessage) sendMessage(statusMessage);
   }, [
+    activeRunId,
+    isLoading,
+    processingSessions,
     selectedProject,
     selectedSession,
     sessionRequestParams,
@@ -277,6 +324,9 @@ function ChatInterfaceV2({
     currentSessionId,
     setCurrentSessionId,
     setIsLoading,
+    setSessionRuntimeState,
+    activeRunId,
+    setActiveRunId,
     setCanAbortSession,
     setIsAborting,
     setClaudeStatus,
@@ -309,10 +359,101 @@ function ChatInterfaceV2({
     setIsAbortPending(true);
   }, [canAbortSession, handleAbortSession, isAbortPending, isLoading]);
 
+  const handleFork = useCallback(async (message: ChatMessage, _carriedPreview: number) => {
+    if (isForkPending || isLoading || sessionIsReadOnly) return;
+    const sessionId = currentSessionId || selectedSession?.id;
+    const fromEntryId = message.entryId;
+    if (!sessionId || !fromEntryId || !selectedProject) {
+      addToast('error', t('fork.missingTarget', { defaultValue: 'Cannot fork this message.' }));
+      return;
+    }
+
+    const projectPath = selectedProject.fullPath || selectedProject.path || '';
+    setIsForkPending(true);
+    try {
+      const response = await api.forkSession(sessionId, { projectPath, fromEntryId });
+      let result: { newSessionId?: string; prefillText?: string; runMode?: string; mode?: string; error?: string } = {};
+      try {
+        result = await response.json();
+      } catch {
+        result = {};
+      }
+      if (!response.ok) {
+        throw new Error(result?.error || `Fork failed (${response.status})`);
+      }
+      const newSessionId = result?.newSessionId;
+      if (!newSessionId) {
+        throw new Error('Fork did not return a new session id');
+      }
+      setRunMode(result.runMode === 'ask' ? 'ask' : result.mode === 'plan' || result.runMode === 'plan' ? 'plan' : 'agent');
+
+      if (typeof window.refreshProjects === 'function') {
+        try {
+          await window.refreshProjects();
+        } catch {
+          // Keep the fork usable even if the sidebar refresh races/fails.
+        }
+      }
+
+      const forkDraft = typeof result.prefillText === 'string'
+        ? result.prefillText
+        : message.type === 'user'
+          ? message.content || ''
+          : '';
+      const forkDraftStorageKey = getDraftInputStorageKey(selectedProject.name, newSessionId);
+      if (forkDraft) {
+        safeLocalStorage.setItem(forkDraftStorageKey, forkDraft);
+      } else {
+        safeLocalStorage.removeItem(forkDraftStorageKey);
+      }
+
+      onNavigateToSession?.(newSessionId);
+      setInput(forkDraft);
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        scrollToBottom?.();
+      });
+      // Messages load asynchronously after the session switch; scroll again
+      // once the carried history has had a chance to render.
+      setTimeout(() => scrollToBottom?.(), 400);
+      addToast(
+        'success',
+        t('fork.ready', {
+          defaultValue: 'Fork created — edit the prompt and send when ready.',
+        }),
+      );
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      addToast('error', messageText || t('fork.failed', { defaultValue: 'Fork failed.' }));
+    } finally {
+      setIsForkPending(false);
+    }
+  }, [
+    addToast,
+    currentSessionId,
+    isForkPending,
+    isLoading,
+    sessionIsReadOnly,
+    onNavigateToSession,
+    scrollToBottom,
+    selectedProject,
+    selectedSession?.id,
+    setInput,
+    t,
+    textareaRef,
+  ]);
+
   useEffect(() => {
     if (!isLoading || !canAbortSession) return;
     const handleGlobalEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || event.repeat || event.defaultPrevented) return;
+      if (
+        event.target instanceof Element
+        && event.target.closest('[data-file-search-input]')
+      ) {
+        return;
+      }
+      if (document.querySelector('[data-modal-overlay]')) return;
       event.preventDefault();
       handleAbortWithPending();
     };
@@ -350,11 +491,11 @@ function ChatInterfaceV2({
 
   // The composer is identical in welcome / normal mode — just rendered in a
   // different parent container. Pulled out so we don't drift between the two.
-  const composer = isReadOnlyBackgroundSession ? (
+  const composer = sessionIsReadOnly ? (
     <div className="mx-auto w-full max-w-[720px] px-6 pb-6 pt-3">
       <div className="rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-[13px] text-neutral-600 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-400">
-        {t('session.readonlyBackground', {
-          defaultValue: 'This background task transcript is read-only.',
+        {t('session.readonlyTranscript', {
+          defaultValue: 'This transcript is read-only.',
         })}
       </div>
     </div>
@@ -383,6 +524,9 @@ function ChatInterfaceV2({
           previous.filter((_, currentIndex) => currentIndex !== index),
         )
       }
+      documentReferences={documentReferences}
+      onRemoveDocumentReference={removeDocumentReference}
+        onOpenDocumentReference={onFileOpen ? (filePath) => onFileOpen(filePath) : undefined}
       uploadingImages={uploadingImages}
       imageErrors={imageErrors}
       showFileDropdown={showFileDropdown}
@@ -404,7 +548,13 @@ function ChatInterfaceV2({
       isLoading={isLoading}
       canAbortSession={canAbortSession}
       isAbortPending={isAbortPending}
+      isBusySendQueued={isBusySendQueued}
+      isBusySendConfirmed={isBusySendConfirmed}
+      onCancelBusySendQueue={cancelBusySendQueue}
       tokenBudget={tokenBudget}
+      thinkingMode={thinkingMode}
+      thinkingModeAvailability={thinkingModeAvailability}
+      onThinkingModeChange={setThinkingMode}
       pendingPermissionRequests={pendingPermissionRequests}
       handlePermissionDecision={handlePermissionDecision}
       handleGrantToolPermission={handleGrantToolPermission}
@@ -415,12 +565,37 @@ function ChatInterfaceV2({
       planModeAvailable={true}
       onPlanExecutionApproved={handlePlanExecutionApproved}
       sendByCtrlEnter={sendByCtrlEnter}
-      chromeless={isWelcomeMode}
+      chromeless={isWelcomeMode && !compact}
     />
+  );
+  const composerSlot = (
+    <div data-chat-composer-slot className="min-h-0 shrink-0">
+      {composer}
+    </div>
   );
 
   if (isWelcomeMode) {
     const projectName = selectedProject?.displayName || selectedProject?.name || '';
+    if (compact) {
+      return (
+        <div className="flex h-full min-w-0 flex-col bg-white dark:bg-neutral-950">
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-6 text-center">
+            <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-xl border border-neutral-200 bg-neutral-50 text-neutral-500 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-400">
+              <MessageSquare className="h-4 w-4" strokeWidth={1.8} />
+            </div>
+            <p className="text-[13px] font-medium text-neutral-700 dark:text-neutral-300">
+              {t('workspace.emptyTitle', { defaultValue: 'Ask PilotDeck about this project' })}
+            </p>
+            <p className="mt-1 max-w-56 text-[12px] leading-5 text-neutral-400 dark:text-neutral-500">
+              {t('workspace.emptyDescription', {
+                defaultValue: 'Reference a workspace file with @ when you want it included.',
+              })}
+            </p>
+          </div>
+          {composerSlot}
+        </div>
+      );
+    }
     return (
       <div className="flex h-full flex-col bg-white dark:bg-neutral-950">
         <div className="flex flex-1 flex-col items-center justify-center px-6">
@@ -435,7 +610,7 @@ function ChatInterfaceV2({
                     defaultValue: 'Pick a project from the sidebar to get started',
                   })}
             </h1>
-            {composer}
+            {composerSlot}
           </div>
         </div>
       </div>
@@ -443,7 +618,7 @@ function ChatInterfaceV2({
   }
 
   return (
-    <div className="flex h-full flex-col bg-white dark:bg-neutral-950">
+    <div className="grid h-full min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden bg-white dark:bg-neutral-950">
       <MessagesPaneV2
         scrollContainerRef={scrollContainerRef}
         onWheel={handleScroll}
@@ -472,12 +647,19 @@ function ChatInterfaceV2({
         autoExpandTools={autoExpandTools}
         showRawParameters={showRawParameters}
         showThinking={showThinking}
+        inlineThinking={inlineThinking}
         setInput={setInput}
         isAssistantWorking={isLoading}
+        sessionRuntimeState={sessionRuntimeState}
+        activeRunId={activeRunId}
         workingStatus={claudeStatus || pilotDeckStatus}
         runMode={runMode}
+        planModeActive={effectivePermissionMode === 'plan'}
+        sessionStore={sessionStore}
+        onFork={sessionIsReadOnly ? undefined : handleFork}
+        forkDisabled={isForkPending}
       />
-      {composer}
+      {composerSlot}
     </div>
   );
 }

@@ -22,6 +22,9 @@ interface ToolRendererProps {
   autoExpandTools?: boolean;
   showRawParameters?: boolean;
   rawToolInput?: string;
+  expansionKey?: string;
+  isToolSectionExpanded?: (sectionKey: string, defaultExpanded?: boolean) => boolean;
+  onToolSectionExpandedChange?: (sectionKey: string, expanded: boolean) => void;
   isSubagentContainer?: boolean;
   subagentState?: {
     childTools: SubagentChildTool[];
@@ -129,6 +132,9 @@ const ToolRendererInner: React.FC<ToolRendererProps> = ({
   autoExpandTools = false,
   showRawParameters = false,
   rawToolInput,
+  expansionKey,
+  isToolSectionExpanded,
+  onToolSectionExpandedChange,
   isSubagentContainer,
   subagentState
 }) => {
@@ -202,7 +208,7 @@ const ToolRendererInner: React.FC<ToolRendererProps> = ({
         'title getter',
         toolName,
         () => typeof displayConfig.title === 'function'
-          ? displayConfig.title(parsedData)
+          ? displayConfig.title(parsedData, { toolResult })
           : displayConfig.title,
         'Details',
       ),
@@ -212,6 +218,9 @@ const ToolRendererInner: React.FC<ToolRendererProps> = ({
     const defaultOpen = displayConfig.defaultOpen !== undefined
       ? displayConfig.defaultOpen
       : autoExpandTools;
+    const expanded = expansionKey
+      ? isToolSectionExpanded?.(expansionKey, defaultOpen)
+      : undefined;
 
     const contentProps = toObject(safeCall(
       'content props getter',
@@ -219,7 +228,8 @@ const ToolRendererInner: React.FC<ToolRendererProps> = ({
       () => displayConfig.getContentProps?.(parsedData, {
         selectedProject,
         createDiff,
-        onFileOpen
+        onFileOpen,
+        toolResult,
       }),
       {},
     ));
@@ -245,7 +255,7 @@ const ToolRendererInner: React.FC<ToolRendererProps> = ({
         break;
 
       case 'markdown':
-        contentComponent = <MarkdownContent content={contentProps.content || ''} />;
+        contentComponent = <MarkdownContent content={contentProps.content || ''} onFileOpen={onFileOpen} />;
         break;
 
       case 'file-list':
@@ -333,6 +343,10 @@ const ToolRendererInner: React.FC<ToolRendererProps> = ({
         toolId={toolId}
         title={title}
         defaultOpen={defaultOpen}
+        open={expanded}
+        onOpenChange={expansionKey && onToolSectionExpandedChange
+          ? (nextExpanded) => onToolSectionExpandedChange(expansionKey, nextExpanded)
+          : undefined}
         onTitleClick={handleTitleClick}
         showRawParameters={mode === 'input' && showRawParameters}
         rawContent={rawToolInput}

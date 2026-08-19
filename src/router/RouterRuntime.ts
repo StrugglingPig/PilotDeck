@@ -2,9 +2,17 @@ import type {
   CanonicalModelEvent,
   CanonicalModelRequest,
   ModelRuntime,
+  ModelProtocol,
 } from "../model/index.js";
+import { cloneMessages, downgradeUnsupportedContent, ModelRequestError } from "../model/index.js";
+import type { InputModality } from "../model/index.js";
 import {
-  DEFAULT_SUBAGENT_MAX_TOKENS,
+  LITELLM_DEFAULT_MAX_RETRIES,
+  LITELLM_INITIAL_RETRY_DELAY_MS,
+  LITELLM_MAX_RETRY_DELAY_MS,
+  LITELLM_RETRY_JITTER,
+} from "../model/streaming/streamModel.js";
+import {
   DEFAULT_SUBAGENT_POLICY,
   type RouterConfig,
   type RouterModelRef,
@@ -28,6 +36,7 @@ import { decideScenario } from "./scenario/decideScenario.js";
 import { stripSubagentTagFromMessages } from "./scenario/subagentDetector.js";
 import { SessionRouterStore } from "./session/SessionRouterStore.js";
 import { SessionUsageCache } from "./session/sessionUsageCache.js";
+import { ProviderHealthTracker } from "./health/ProviderHealthTracker.js";
 import {
   createZeroUsageState,
   observeEventForZeroUsage,
@@ -36,6 +45,12 @@ import {
 import { TokenStatsCollector } from "./stats/TokenStatsCollector.js";
 import { classifyAndRoute } from "./tokenSaver/classifyAndRoute.js";
 import { countMessagesTokens, countResponseTokens, dispose as disposeTokenizer } from "./utils/countTokens.js";
+import { calculateCacheReadCost, calculateInputCost } from "./utils/modelPricing.js";
+import {
+  collectRequiredInputModalities,
+  missingInputModalities,
+} from "./utils/mediaRequirements.js";
+import type { TelemetryClient } from "../telemetry/index.js";
 
 export type RouterRuntimeDeps = {
   modelRuntime: ModelRuntime;
@@ -44,6 +59,7 @@ export type RouterRuntimeDeps = {
   /** Optional skill prompt loader for AutoOrchestrate; receives extension id, returns text. */
   loadSkillPrompt?: (extensionId: string) => Promise<string | undefined>;
   events?: RouterEventBus;
+  telemetry?: TelemetryClient;
   now?: () => Date;
   /**
    * Externally-owned session store that survives config-reload cycles.
@@ -54,6 +70,8 @@ export type RouterRuntimeDeps = {
 
 export type InvalidateStickyResult = {
   previousTier?: string;
+  previousProvider?: string;
+  previousModel?: string;
   orchestrating: boolean;
 };
 
@@ -69,6 +87,7 @@ export type RouterRuntime = {
     request: CanonicalModelRequest,
     ctx: RouterExecuteContext & { sessionId: string; isMainAgent: boolean; previousTier?: string },
   ): AsyncIterable<CanonicalModelEvent>;
+  materializeRequest(decision: RouterDecision, request: CanonicalModelRequest): CanonicalModelRequest;
   /**
    * Clear routing sticky (provider/model/tier) for a session while preserving
    * orchestration state.  Call at the start of each new user turn so the
@@ -84,9 +103,10 @@ export function createRouterRuntime(
   config: RouterConfig,
   deps: RouterRuntimeDeps,
 ): RouterRuntime {
+  const enabled = config.enabled !== false;
   const stats = new TokenStatsCollector({
     ...config.stats,
-    enabled: config.stats?.enabled ?? false,
+    enabled: enabled && (config.stats?.enabled ?? false),
     baselineModel: config.scenarios?.default
       ? { provider: config.scenarios.default.provider, model: config.scenarios.default.model }
       : config.stats?.baselineModel,
@@ -99,6 +119,177 @@ export function createRouterRuntime(
   const customRouters = deps.customRouterRegistry ?? noopCustomRouterRegistry;
   const judgeRuntime = deps.judgeRuntime ?? deps.modelRuntime;
   const events = deps.events ?? { emit: () => undefined };
+  const telemetry = deps.telemetry;
+  const healthTrackers = new Map<string, ProviderHealthTracker>();
+  function getHealthTracker(sessionId: string): ProviderHealthTracker {
+    let tracker = healthTrackers.get(sessionId);
+    if (!tracker) {
+      tracker = new ProviderHealthTracker();
+      healthTrackers.set(sessionId, tracker);
+    }
+    return tracker;
+  }
+
+  function missingForModel(
+    ref: RouterModelRef,
+    required: readonly InputModality[],
+  ): InputModality[] {
+    if (required.length === 0) {
+      return [];
+    }
+    try {
+      return missingInputModalities(
+        deps.modelRuntime.getMultimodal(ref.provider, ref.model),
+        required,
+      );
+    } catch {
+      return [...required];
+    }
+  }
+
+  function supportsMediaRequirements(
+    ref: RouterModelRef,
+    required: readonly InputModality[],
+  ): boolean {
+    return missingForModel(ref, required).length === 0;
+  }
+
+  function fallbackCandidatesFor(scenarioType: RouterScenarioType): RouterModelRef[] {
+    const candidates: RouterModelRef[] = [];
+    const add = (refs: RouterModelRef[] | undefined) => {
+      for (const ref of refs ?? []) {
+        const id = ref.id || `${ref.provider}/${ref.model}`;
+        if (!candidates.some((candidate) => candidate.provider === ref.provider && candidate.model === ref.model)) {
+          candidates.push({ ...ref, id });
+        }
+      }
+    };
+    add((config.fallback as Record<string, RouterModelRef[] | undefined> | undefined)?.[scenarioType]);
+    add(config.fallback?.default);
+    return candidates;
+  }
+
+  function findCompatibleFallback(
+    scenarioType: RouterScenarioType,
+    required: readonly InputModality[],
+  ): RouterModelRef | undefined {
+    return fallbackCandidatesFor(scenarioType)
+      .find((ref) => supportsMediaRequirements(ref, required));
+  }
+
+  function rerouteDecisionForMedia(
+    decision: RouterDecision,
+    messages: CanonicalModelRequest["messages"],
+    mutations: RouterMutationsLog,
+  ): RouterMutationsLog {
+    const required = collectRequiredInputModalities(messages);
+    if (required.length === 0) {
+      return mutations;
+    }
+
+    const selected: RouterModelRef = {
+      id: `${decision.provider}/${decision.model}`,
+      provider: decision.provider,
+      model: decision.model,
+    };
+    if (supportsMediaRequirements(selected, required)) {
+      return mutations;
+    }
+
+    const replacement = findCompatibleFallback(decision.scenarioType, required);
+    if (!replacement) {
+      return mutations;
+    }
+
+    decision.provider = replacement.provider;
+    decision.model = replacement.model;
+    decision.resolvedFrom = "fallback";
+    return {
+      ...mutations,
+      mediaCapabilityRerouted: {
+        required: [...required],
+        from: selected.id,
+        to: replacement.id || `${replacement.provider}/${replacement.model}`,
+      },
+    };
+  }
+
+  function maybePreserveStickyForCache(
+    current: RouterModelRef | undefined,
+    next: RouterModelRef,
+    messages: CanonicalModelRequest["messages"],
+    lastUsage: import("../model/index.js").CanonicalUsage | undefined,
+  ): { selection: RouterModelRef; mutation?: RouterMutationsLog["cacheAwareSwitch"] } {
+    const cacheAware = config.tokenSaver?.cacheAwareSwitching;
+    if (cacheAware?.enabled === false || !current) {
+      return { selection: next };
+    }
+    if (current.provider === next.provider && current.model === next.model) {
+      return { selection: next };
+    }
+
+    const estimatedInputTokens = countMessagesTokens(messages);
+    const observedInputTokens = lastUsage?.inputTokens ?? 0;
+    const observedCacheReadTokens = lastUsage?.cacheReadTokens ?? 0;
+    const observedCacheHitRatio = observedInputTokens > 0
+      ? Math.min(1, Math.max(0, observedCacheReadTokens / observedInputTokens))
+      : 0;
+    if (observedCacheHitRatio <= 0) {
+      return { selection: next };
+    }
+
+    const estimatedCacheReadTokens = Math.floor(estimatedInputTokens * observedCacheHitRatio);
+    const estimatedUncachedTokens = Math.max(0, estimatedInputTokens - estimatedCacheReadTokens);
+    const cachedCost = calculateCacheReadCost(
+      estimatedCacheReadTokens,
+      current.provider,
+      current.model,
+      config.stats?.modelPricing,
+    ) + calculateInputCost(
+      estimatedUncachedTokens,
+      current.provider,
+      current.model,
+      config.stats?.modelPricing,
+    );
+    const prefillCost = calculateInputCost(
+      estimatedInputTokens,
+      next.provider,
+      next.model,
+      config.stats?.modelPricing,
+    );
+
+    const minSavingsRatio = cacheAware?.minSavingsRatio ?? 0;
+    const requiredSavings = cachedCost * minSavingsRatio;
+    const shouldSwitch = prefillCost + Number.EPSILON < cachedCost - requiredSavings;
+    const from = `${current.provider}/${current.model}`;
+    const to = `${next.provider}/${next.model}`;
+
+    if (shouldSwitch) {
+      return {
+        selection: next,
+        mutation: {
+          action: "switched",
+          from,
+          to,
+          cachedCost,
+          prefillCost,
+          estimatedInputTokens,
+        },
+      };
+    }
+
+    return {
+      selection: current,
+      mutation: {
+        action: "kept_sticky",
+        from,
+        to,
+        cachedCost,
+        prefillCost,
+        estimatedInputTokens,
+      },
+    };
+  }
 
   async function resolveCustom(
     input: RouterDecisionInput,
@@ -133,6 +324,18 @@ export function createRouterRuntime(
   }
 
   async function decide(input: RouterDecisionInput): Promise<RouterDecision> {
+    if (!enabled) {
+      return {
+        provider: input.request.provider,
+        model: input.request.model,
+        scenarioType: "default",
+        isSubagent: !input.isMainAgent,
+        orchestrating: false,
+        resolvedFrom: "scenario",
+        mutations: {},
+      };
+    }
+
     const sticky = sessionStore.get(input.sessionId, !input.isMainAgent);
     const baseUsage = usageCache.get(input.sessionId);
     const inputWithUsage: RouterDecisionInput = {
@@ -151,6 +354,15 @@ export function createRouterRuntime(
     const scenarioOutcome = decideScenario(inputWithUsage, config.scenarios ?? {} as any);
 
     let scenarioType: RouterScenarioType = scenarioOutcome.scenarioType;
+    const previousStickySelection = (input.metadata?.previousProvider && input.metadata.previousModel)
+      ? {
+        id: `${input.metadata.previousProvider}/${input.metadata.previousModel}`,
+        provider: input.metadata.previousProvider,
+        model: input.metadata.previousModel,
+      }
+      : sticky?.stickyProvider && sticky.stickyModel
+      ? { id: `${sticky.stickyProvider}/${sticky.stickyModel}`, provider: sticky.stickyProvider, model: sticky.stickyModel }
+      : undefined;
     let selection: RouterModelRef | undefined =
       custom?.provider && custom.model
         ? { id: `${custom.provider}/${custom.model}`, provider: custom.provider, model: custom.model }
@@ -163,6 +375,7 @@ export function createRouterRuntime(
         : "scenario";
 
     let tokenSaverTier: string | undefined;
+    let cacheAwareSwitch: RouterMutationsLog["cacheAwareSwitch"];
     const subagentPolicy = config.tokenSaver?.subagent?.policy ?? DEFAULT_SUBAGENT_POLICY;
     if (
       !custom?.provider &&
@@ -205,7 +418,10 @@ export function createRouterRuntime(
           config: config.tokenSaver,
           messages: input.request.messages,
           judgeRuntime,
+          abortSignal: input.abortSignal,
           previousTier: input.metadata?.previousTier,
+          sessionId: input.sessionId,
+          telemetry,
         });
         if (tokenSaver) {
           if (tokenSaver.failureReason) {
@@ -214,13 +430,28 @@ export function createRouterRuntime(
               sessionId: input.sessionId,
               reason: tokenSaver.failureReason,
               fallbackTier: tokenSaver.tier,
+              judgeProvider: config.tokenSaver.judge.provider,
+              judgeModel: config.tokenSaver.judge.model,
+              attempts: tokenSaver.failure?.attempts ?? 1,
+              ...(tokenSaver.failure?.code ? { errorCode: tokenSaver.failure.code } : {}),
+              ...(tokenSaver.failure?.message ? { errorMessage: tokenSaver.failure.message } : {}),
             });
           }
           if (tokenSaver.selection) {
             selection = tokenSaver.selection;
             resolvedFrom = "tokenSaver";
+            const cacheAware = maybePreserveStickyForCache(
+              previousStickySelection,
+              selection,
+              input.request.messages,
+              baseUsage,
+            );
+            selection = cacheAware.selection;
+            cacheAwareSwitch = cacheAware.mutation;
           }
-          tokenSaverTier = tokenSaver.tier;
+          tokenSaverTier = cacheAwareSwitch?.action === "kept_sticky"
+            ? (sticky?.tokenSaverTier ?? input.metadata?.previousTier ?? tokenSaver.tier)
+            : tokenSaver.tier;
         }
       }
     }
@@ -264,55 +495,29 @@ export function createRouterRuntime(
       `[router] decision: tier=${tokenSaverTier}, model=${selection.provider}/${selection.model}, orchGate=${orchGate}, alreadyOrch=${alreadyOrchestrating}, resolvedFrom=${resolvedFrom}`,
     );
 
-    let skillPrompt: string | undefined;
-    if (
-      config.autoOrchestrate?.enabled &&
-      orchGate &&
-      input.isMainAgent &&
-      config.autoOrchestrate.skillExtensionId &&
-      deps.loadSkillPrompt
-    ) {
-      try {
-        skillPrompt = await deps.loadSkillPrompt(config.autoOrchestrate.skillExtensionId);
-      } catch {
-        skillPrompt = undefined;
-      }
-    }
-
     let mutations: RouterMutationsLog = {};
+    if (cacheAwareSwitch) {
+      mutations = { ...mutations, cacheAwareSwitch };
+    }
     if (config.autoOrchestrate?.enabled && orchGate) {
       const orchestrated = applyOrchestration({
-        request: input.request,
         config: config.autoOrchestrate,
         isMainAgent: input.isMainAgent,
         tier: tokenSaverTier,
         alreadyOrchestrating,
-        skillPrompt,
       });
       if (orchestrated.applied) {
         mutations = { ...mutations, ...orchestrated.mutations };
-        decision.requestPatch = {
-          messages: orchestrated.request.messages,
-          tools: orchestrated.request.tools,
-          systemPrompt: orchestrated.request.systemPrompt,
-        };
         decision.orchestrating = true;
-        if (config.autoOrchestrate.mainAgentModel) {
-          decision.provider = config.autoOrchestrate.mainAgentModel.provider;
-          decision.model = config.autoOrchestrate.mainAgentModel.model;
-        }
       }
-    }
-
-    if (!input.isMainAgent && config.autoOrchestrate?.subagentModel) {
-      decision.provider = config.autoOrchestrate.subagentModel.provider;
-      decision.model = config.autoOrchestrate.subagentModel.model;
-      mutations = { ...mutations, subagentModelOverride: true };
     }
 
     if (scenarioOutcome.subagentModelHint || decision.isSubagent) {
       mutations = { ...mutations, subagentTagStripped: true };
     }
+
+    const mediaMessages = decision.requestPatch?.messages ?? input.request.messages;
+    mutations = rerouteDecisionForMedia(decision, mediaMessages, mutations);
 
     decision.mutations = mutations;
 
@@ -344,13 +549,13 @@ export function createRouterRuntime(
     if (decision.mutations.subagentTagStripped) {
       messages = stripSubagentTagFromMessages(messages);
     }
-    return {
+    return clampMaxOutputTokensToModelCap({
       ...request,
       ...decision.requestPatch,
       provider: decision.provider,
       model: decision.model,
       messages,
-    };
+    }, deps.modelRuntime);
   }
 
   async function* execute(
@@ -358,18 +563,66 @@ export function createRouterRuntime(
     request: CanonicalModelRequest,
     ctx: RouterExecuteContext,
   ): AsyncIterable<CanonicalModelEvent> {
+    if (!enabled) {
+      const passthroughRequest: CanonicalModelRequest = {
+        ...request,
+        provider: decision.provider,
+        model: decision.model,
+      };
+      const downgradedPassthrough = downgradeRequestForAttempt(
+        passthroughRequest,
+        { id: `${decision.provider}/${decision.model}`, provider: decision.provider, model: decision.model },
+        deps.modelRuntime,
+      );
+      const cappedPassthroughRequest = clampMaxOutputTokensToModelCap(downgradedPassthrough, deps.modelRuntime);
+      let sawErrorEvent = false;
+      for await (const item of streamAttempt(cappedPassthroughRequest, deps.modelRuntime, ctx, events)) {
+        if (item.kind === "event") {
+          if (item.event.type === "error") {
+            sawErrorEvent = true;
+          }
+          yield item.event;
+          continue;
+        }
+        if (item.outcome.error && !sawErrorEvent) {
+          yield { type: "error", error: item.outcome.error };
+        }
+      }
+      return;
+    }
+
     const startedAt = (deps.now?.() ?? new Date()).toISOString();
     const fallbackPlan = planFallback(config.fallback, decision.scenarioType);
-    const attempts: RouterModelRef[] = [
-      { id: `${decision.provider}/${decision.model}`, provider: decision.provider, model: decision.model },
+    const baseRequest = applyDecisionToRequest(decision, request);
+    const requiredModalities = collectRequiredInputModalities(baseRequest.messages);
+    const requestedAttempt: RouterModelRef = {
+      id: `${decision.provider}/${decision.model}`,
+      provider: decision.provider,
+      model: decision.model,
+    };
+    const candidateAttempts: RouterModelRef[] = [
+      requestedAttempt,
       ...fallbackPlan.attempts,
+    ].filter((attempt, index, all) =>
+      all.findIndex((candidate) =>
+        candidate.provider === attempt.provider && candidate.model === attempt.model
+      ) === index
+    );
+    const nativeAttempts: RouterModelRef[] = candidateAttempts
+      .filter((attempt) => supportsMediaRequirements(attempt, requiredModalities));
+    const downgradedAttempts: RouterModelRef[] = requiredModalities.length > 0
+      ? candidateAttempts.filter((attempt) => !supportsMediaRequirements(attempt, requiredModalities))
+      : [];
+    const attemptPlans: AttemptPlan[] = [
+      ...nativeAttempts.map((attempt) => ({ attempt, downgradeUnsupportedMedia: false })),
+      ...downgradedAttempts.map((attempt) => ({ attempt, downgradeUnsupportedMedia: true })),
     ];
     const zeroUsageMax = Math.max(1, config.zeroUsageRetry?.maxAttempts ?? 5);
     const zeroUsageEnabled = config.zeroUsageRetry?.enabled ?? true;
     const transientRetryEnabled = config.transientRetry?.enabled ?? true;
-    const transientRetryMax = Math.max(1, config.transientRetry?.maxAttempts ?? 5);
-    const transientBaseDelayMs = config.transientRetry?.baseDelayMs ?? 1000;
-    const transientMaxDelayMs = config.transientRetry?.maxDelayMs ?? 30000;
+    const transientRetryMax = Math.max(1, config.transientRetry?.maxAttempts ?? LITELLM_DEFAULT_MAX_RETRIES);
+    const transientBaseDelayMs = config.transientRetry?.baseDelayMs ?? LITELLM_INITIAL_RETRY_DELAY_MS;
+    const transientMaxDelayMs = config.transientRetry?.maxDelayMs ?? LITELLM_MAX_RETRY_DELAY_MS;
 
     let lastBuffered: CanonicalModelEvent[] = [];
     let lastError: import("../model/index.js").CanonicalModelError | undefined;
@@ -378,18 +631,50 @@ export function createRouterRuntime(
     let lastDecision: RouterDecision = decision;
     let lastHasYieldedContent = false;
 
-    outer: for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
+    if (attemptPlans.length === 0) {
+      const missing = missingForModel(requestedAttempt, requiredModalities);
+      const error = createUnsupportedMediaError(
+        requestedAttempt,
+        requiredModalities,
+        missing,
+        protocolForProvider(deps.modelRuntime, requestedAttempt.provider),
+      );
+      events.emit({
+        type: "pilotdeck_router_execute_failed",
+        sessionId: ctx.sessionId,
+        turnId: ctx.turnId,
+        scenarioType: decision.scenarioType,
+        provider: requestedAttempt.provider,
+        model: requestedAttempt.model,
+        error,
+      });
+      yield { type: "error", error };
+      return;
+    }
+
+    outer: for (let attemptIndex = 0; attemptIndex < attemptPlans.length; attemptIndex += 1) {
       if (ctx.abortSignal?.aborted) {
         return;
       }
-      const attempt = attempts[attemptIndex];
+      const attemptPlan = attemptPlans[attemptIndex];
+      const attempt = attemptPlan.attempt;
+      if (
+        attemptIndex > 0 &&
+        getHealthTracker(ctx.sessionId).shouldSkip(attempt.provider) &&
+        attemptIndex < attemptPlans.length - 1
+      ) {
+        continue;
+      }
       const attemptDecision: RouterDecision = {
         ...decision,
         provider: attempt.provider,
         model: attempt.model,
         resolvedFrom: attemptIndex === 0 ? decision.resolvedFrom : "fallback",
       };
-      const attemptRequest = applyDecisionToRequest(attemptDecision, request);
+      let attemptRequest = applyDecisionToRequest(attemptDecision, request);
+      if (attemptPlan.downgradeUnsupportedMedia) {
+        attemptRequest = downgradeRequestForAttempt(attemptRequest, attempt, deps.modelRuntime);
+      }
       lastAttempt = attempt;
       lastDecision = attemptDecision;
 
@@ -398,10 +683,16 @@ export function createRouterRuntime(
         const estimated = countMessagesTokens(attemptRequest.messages);
         if (estimated > budget) {
           yield {
-            type: "text_delta",
-            text: `[PilotDeck] Sub-agent budget exceeded (${estimated} est. tokens > ${budget} limit). Terminating.`,
+            type: "error",
+            error: {
+              provider: attempt.provider,
+              protocol: protocolForProvider(deps.modelRuntime, attempt.provider),
+              code: "subagent_budget_exceeded",
+              message: `Sub-agent budget exceeded (${estimated} estimated tokens > ${budget} limit).`,
+              retryable: false,
+              userHint: "Reduce the subagent prompt/context, increase the subagent token budget, or split the task into smaller steps.",
+            },
           } as CanonicalModelEvent;
-          yield { type: "message_end", finishReason: "stop" } as CanonicalModelEvent;
           return;
         }
       }
@@ -417,7 +708,7 @@ export function createRouterRuntime(
         const pending: CanonicalModelEvent[] = [];
         let outcome: AttemptOutcome | undefined;
 
-        for await (const item of streamAttempt(attemptRequest, deps.modelRuntime, ctx.abortSignal)) {
+        for await (const item of streamAttempt(attemptRequest, deps.modelRuntime, ctx, events)) {
           if (item.kind === "outcome") {
             outcome = item.outcome;
             break;
@@ -453,11 +744,10 @@ export function createRouterRuntime(
 
         if (outcome.error) {
           lastError = outcome.error;
-          // Only retry/fallback if we haven't surfaced content yet — otherwise
-          // we'd produce duplicate text on the consumer side.
+          getHealthTracker(ctx.sessionId).recordFailure(attempt.provider);
           if (!hasYieldedContent && isFallbackEligible(outcome.error)) {
-            if (attemptIndex < attempts.length - 1) {
-              const next = attempts[attemptIndex + 1];
+            if (attemptIndex < attemptPlans.length - 1) {
+              const next = attemptPlans[attemptIndex + 1].attempt;
               events.emit({
                 type: "pilotdeck_router_fallback",
                 sessionId: ctx.sessionId,
@@ -470,6 +760,24 @@ export function createRouterRuntime(
                 toModel: next.model,
                 error: outcome.error,
               });
+              telemetry?.trackFeatureLoopStage({
+                module: "router",
+                ownerModule: "router",
+                phase: "fallback",
+                loopStage: "module_event",
+                outcome: "success",
+                sessionId: ctx.sessionId,
+                metadata: {
+                  event: "fallback_attempt",
+                  scenarioType: attemptDecision.scenarioType,
+                  attempt: attemptIndex + 1,
+                  fromProvider: attempt.provider,
+                  fromModel: attempt.model,
+                  toProvider: next.provider,
+                  toModel: next.model,
+                  errorCode: outcome.error.code,
+                },
+              });
               continue outer;
             }
           }
@@ -479,10 +787,9 @@ export function createRouterRuntime(
             transientRetryEnabled &&
             transientRetryCount < transientRetryMax
           ) {
-            const delay = Math.min(
-              transientBaseDelayMs * Math.pow(2, transientRetryCount) + Math.random() * 500,
-              transientMaxDelayMs,
-            );
+            const delay = outcome.error.retryAfterMs != null
+              ? Math.min(outcome.error.retryAfterMs, transientMaxDelayMs)
+              : calculateLiteLLMRetryDelay(transientRetryCount, transientBaseDelayMs, transientMaxDelayMs);
             console.warn(
               `[PilotDeck] transientRetry: ${outcome.error.code} (attempt ${transientRetryCount + 1}/${transientRetryMax}, delay=${Math.round(delay)}ms)`,
             );
@@ -496,13 +803,37 @@ export function createRouterRuntime(
               model: attempt.model,
               errorCode: outcome.error.code,
             });
+            events.emit({
+              type: "pilotdeck_router_retry_progress",
+              sessionId: ctx.sessionId,
+              turnId: ctx.turnId,
+              attempt: transientRetryCount + 1,
+              maxAttempts: transientRetryMax,
+              delayMs: Math.round(delay),
+              reason: classifyRetryReason(outcome.error.code),
+              provider: attempt.provider,
+              model: attempt.model,
+            });
+            telemetry?.trackFeatureLoopStage({
+              module: "router",
+              ownerModule: "router",
+              phase: "fallback",
+              loopStage: "module_event",
+              outcome: "success",
+              sessionId: ctx.sessionId,
+              metadata: {
+                event: "transient_retry",
+                attempt: transientRetryCount + 1,
+                delayMs: Math.round(delay),
+                provider: attempt.provider,
+                model: attempt.model,
+                errorCode: outcome.error.code,
+              },
+            });
             await abortableDelay(delay, ctx.abortSignal);
             transientRetryCount++;
             continue;
           }
-          // Either we've already surfaced content, the error isn't eligible
-          // for fallback/retry, or we've exhausted all retry attempts. Replay
-          // any queued framing events then surface the error.
           for (const queued of pending) {
             yield queued;
           }
@@ -528,12 +859,37 @@ export function createRouterRuntime(
             provider: attempt.provider,
             model: attempt.model,
           });
+          events.emit({
+            type: "pilotdeck_router_retry_progress",
+            sessionId: ctx.sessionId,
+            turnId: ctx.turnId,
+            attempt: zeroUsageAttempt,
+            maxAttempts: zeroUsageMax,
+            delayMs: 500 * zeroUsageAttempt,
+            reason: "zero_usage",
+            provider: attempt.provider,
+            model: attempt.model,
+          });
+          telemetry?.trackFeatureLoopStage({
+            module: "router",
+            ownerModule: "router",
+            phase: "fallback",
+            loopStage: "module_event",
+            outcome: "success",
+            sessionId: ctx.sessionId,
+            metadata: {
+              event: "zero_usage_retry",
+              attempt: zeroUsageAttempt,
+              provider: attempt.provider,
+              model: attempt.model,
+            },
+          });
           await abortableDelay(500 * zeroUsageAttempt, ctx.abortSignal);
           continue;
         }
 
-        // Success path: flush any pending framing events that didn't reach
-        // a content event (e.g. zero-content responses, tool-only turns).
+        getHealthTracker(ctx.sessionId).recordSuccess(attempt.provider);
+
         if (!hasYieldedContent) {
           for (const queued of pending) {
             yield queued;
@@ -604,7 +960,7 @@ export function createRouterRuntime(
           }
         }
       }
-      yield { type: "error", error: lastError };
+      yield { type: "error", error: { ...lastError, provider: lastAttempt.provider, model: lastAttempt.model } };
     }
   }
 
@@ -616,14 +972,21 @@ export function createRouterRuntime(
       request,
       sessionId: ctx.sessionId,
       isMainAgent: ctx.isMainAgent,
+      abortSignal: ctx.abortSignal,
       metadata: ctx.previousTier ? { previousTier: ctx.previousTier } : undefined,
     });
     yield* execute(decision, request, ctx);
   }
 
   function invalidateSticky(sessionId: string): InvalidateStickyResult {
+    if (!enabled) {
+      return { orchestrating: false };
+    }
+
     const current = sessionStore.get(sessionId, false);
     const previousTier = current?.tokenSaverTier;
+    const previousProvider = current?.stickyProvider;
+    const previousModel = current?.stickyModel;
     const orchestrating = current?.orchestrating ?? false;
     if (orchestrating && previousTier) {
       // While orchestrating, preserve the tier sticky so continuation turns
@@ -645,15 +1008,17 @@ export function createRouterRuntime(
         updatedAt: (deps.now?.() ?? new Date()).getTime(),
       });
     }
-    return { previousTier, orchestrating };
+    return { previousTier, previousProvider, previousModel, orchestrating };
   }
 
   return {
     decide,
     execute,
     stream,
+    materializeRequest: applyDecisionToRequest,
     invalidateSticky,
     observeUsage(sessionId, usage) {
+      if (!enabled) return;
       usageCache.observe(sessionId, usage);
     },
     stats,
@@ -663,9 +1028,15 @@ export function createRouterRuntime(
       disposeTokenizer();
       if (!externalStore) sessionStore.clear();
       usageCache.clear();
+      healthTrackers.clear();
     },
   };
 }
+
+type AttemptPlan = {
+  attempt: RouterModelRef;
+  downgradeUnsupportedMedia: boolean;
+};
 
 type AttemptOutcome = {
   buffered: CanonicalModelEvent[];
@@ -690,6 +1061,43 @@ function isContentEvent(event: CanonicalModelEvent): boolean {
   );
 }
 
+function clampMaxOutputTokensToModelCap(
+  request: CanonicalModelRequest,
+  modelRuntime: ModelRuntime,
+): CanonicalModelRequest {
+  const requested = request.maxOutputTokens;
+  if (requested === undefined) {
+    return request;
+  }
+
+  try {
+    const cap = modelRuntime.getCapabilities(request.provider, request.model).maxOutputTokens;
+    if (Number.isFinite(cap) && cap > 0 && requested > cap) {
+      return { ...request, maxOutputTokens: cap };
+    }
+  } catch {
+    // Unknown provider/model — let validateModelRequest surface the real error.
+  }
+  return request;
+}
+
+function downgradeRequestForAttempt(
+  request: CanonicalModelRequest,
+  attempt: RouterModelRef,
+  modelRuntime: ModelRuntime,
+): CanonicalModelRequest {
+  let multimodal: ReturnType<ModelRuntime["getMultimodal"]>;
+  try {
+    multimodal = modelRuntime.getMultimodal(attempt.provider, attempt.model);
+  } catch {
+    // Unknown provider/model should still be reported by validateModelRequest.
+    return request;
+  }
+  const messages = cloneMessages(request.messages);
+  downgradeUnsupportedContent(messages, multimodal);
+  return { ...request, messages };
+}
+
 /**
  * Live attempt — yields each model event the moment it arrives, then yields
  * a final `{ outcome }` sentinel with retry/usage metadata. The previous
@@ -705,7 +1113,8 @@ function isContentEvent(event: CanonicalModelEvent): boolean {
 async function* streamAttempt(
   request: CanonicalModelRequest,
   modelRuntime: ModelRuntime,
-  abortSignal?: AbortSignal,
+  ctx: RouterExecuteContext,
+  events: RouterEventBus,
 ): AsyncGenerator<
   | { kind: "event"; event: CanonicalModelEvent }
   | { kind: "outcome"; outcome: AttemptOutcome }
@@ -713,9 +1122,25 @@ async function* streamAttempt(
   const buffered: CanonicalModelEvent[] = [];
   const state = createZeroUsageState();
   let providerError: import("../model/index.js").CanonicalModelError | undefined;
+  const abortSignal = ctx.abortSignal;
 
   try {
-    for await (const event of modelRuntime.stream(request, { signal: abortSignal })) {
+    for await (const event of modelRuntime.stream(request, {
+      signal: abortSignal,
+      onRetryProgress(progress) {
+        events.emit({
+          type: "pilotdeck_router_retry_progress",
+          sessionId: ctx.sessionId,
+          turnId: ctx.turnId,
+          attempt: progress.attempt,
+          maxAttempts: progress.maxAttempts,
+          delayMs: progress.delayMs,
+          reason: progress.reason,
+          provider: progress.provider,
+          model: progress.model,
+        });
+      },
+    })) {
       if (abortSignal?.aborted) {
         throwAbortError(abortSignal.reason);
       }
@@ -731,9 +1156,10 @@ async function* streamAttempt(
       throw error;
     }
     const fromError = (error as { error?: import("../model/index.js").CanonicalModelError })?.error;
-    providerError = fromError ?? {
+    const protocol = protocolForProvider(modelRuntime, request.provider);
+    providerError = fromError ?? canonicalizeModelRequestError(error, request, protocol) ?? {
       provider: request.provider,
-      protocol: "anthropic",
+      protocol,
       code: classifyNetworkErrorCode(error),
       message: error instanceof Error ? error.message : String(error),
       retryable: isNetworkTransient(error),
@@ -749,6 +1175,33 @@ async function* streamAttempt(
       shouldRetryZeroUsage: shouldRetryZeroUsage(state),
     },
   };
+}
+
+function canonicalizeModelRequestError(
+  error: unknown,
+  request: CanonicalModelRequest,
+  protocol: ModelProtocol,
+): import("../model/index.js").CanonicalModelError | undefined {
+  if (!(error instanceof ModelRequestError)) {
+    return undefined;
+  }
+
+  return {
+    provider: request.provider,
+    protocol,
+    code: error.code,
+    message: error.message,
+    retryable: false,
+    raw: error.details,
+  };
+}
+
+function protocolForProvider(modelRuntime: ModelRuntime, providerId: string): ModelProtocol {
+  try {
+    return modelRuntime.getProviderProtocol(providerId) ?? "openai";
+  } catch {
+    return "openai";
+  }
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -807,3 +1260,35 @@ function classifyNetworkErrorCode(error: unknown): string {
   return "network_error";
 }
 
+function classifyRetryReason(errorCode: string): "rate_limit" | "server_error" | "network_error" | "zero_usage" | "overloaded" {
+  if (errorCode === "rate_limit_error") return "rate_limit";
+  if (errorCode === "overloaded_error") return "overloaded";
+  if (errorCode === "server_error") return "server_error";
+  if (errorCode === "network_error" || errorCode === "timeout") return "network_error";
+  return "server_error";
+}
+
+function calculateLiteLLMRetryDelay(attempt: number, baseDelayMs: number, maxDelayMs: number): number {
+  const deterministicDelay = baseDelayMs * (attempt + 1);
+  const jitterDelay = deterministicDelay * LITELLM_RETRY_JITTER * Math.random();
+  return Math.min(deterministicDelay + jitterDelay, maxDelayMs);
+}
+
+function createUnsupportedMediaError(
+  attempt: RouterModelRef,
+  required: readonly InputModality[],
+  missing: readonly InputModality[],
+  protocol: ModelProtocol,
+): import("../model/index.js").CanonicalModelError {
+  const missingText = (missing.length > 0 ? missing : required).join(", ");
+  const requiredText = required.join(", ");
+  return {
+    provider: attempt.provider,
+    protocol,
+    code: "unsupported_modality",
+    message:
+      `Router could not find a configured fallback model for ${attempt.provider}/${attempt.model} ` +
+      `that supports required input modalities: ${requiredText}. Missing: ${missingText}.`,
+    retryable: false,
+  };
+}

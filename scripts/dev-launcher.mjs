@@ -54,7 +54,7 @@ function parsePort(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function isPortFree(port, host = '0.0.0.0') {
+function isPortFreeOnHost(port, host) {
   return new Promise((resolveCheck) => {
     const probe = createServer();
     probe.once('error', () => resolveCheck(false));
@@ -63,6 +63,10 @@ function isPortFree(port, host = '0.0.0.0') {
     });
     probe.listen(port, host);
   });
+}
+
+async function isPortFree(port) {
+  return isPortFreeOnHost(port, '0.0.0.0');
 }
 
 async function findFreePort(label, base, hardOverride) {
@@ -116,13 +120,12 @@ async function main() {
     PILOTDECK_GATEWAY_URL:
       process.env.PILOTDECK_GATEWAY_URL ?? `ws://127.0.0.1:${gateway.port}/ws`,
     VITE_PORT: String(vite.port),
-    PILOTDECK_SKIP_DEFAULT_PROJECT: '1',
   };
 
   const child = spawn(
     'npm',
     ['--workspace', 'ui', 'run', 'dev:concurrent'],
-    { cwd: repoRoot, env, stdio: 'inherit' },
+    { cwd: repoRoot, env, stdio: 'inherit', shell: true },
   );
 
   const forward = (signal) => {

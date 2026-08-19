@@ -23,7 +23,7 @@ interface UseSlashCommandsOptions {
   input: string;
   setInput: Dispatch<SetStateAction<string>>;
   textareaRef: RefObject<HTMLTextAreaElement>;
-  onExecuteCommand: (command: SlashCommand, rawInput?: string) => void | Promise<void>;
+  inputValueRef?: { current: string };
 }
 
 const getCommandHistoryKey = (projectName: string) => `command_history_${projectName}`;
@@ -46,15 +46,56 @@ const saveCommandHistory = (projectName: string, history: Record<string, number>
   safeLocalStorage.setItem(getCommandHistoryKey(projectName), JSON.stringify(history));
 };
 
-const isPromiseLike = (value: unknown): value is Promise<unknown> =>
-  Boolean(value) && typeof (value as Promise<unknown>).then === 'function';
+const getCommandKey = (command: SlashCommand) =>
+  `${command.name}::${command.namespace || command.type || 'other'}::${command.path || ''}`;
+
+const getCommandNamespace = (command: SlashCommand) =>
+  command.namespace || command.type || 'other';
+
+const groupCommandsForDisplay = (
+  commands: SlashCommand[],
+  frequentCommands: SlashCommand[],
+): SlashCommand[] => {
+  const preferredOrder = frequentCommands.length > 0
+    ? ['pinned', 'frequent', 'builtin', 'project', 'user', 'other']
+    : ['pinned', 'builtin', 'project', 'user', 'other'];
+  const groups = new Map<string, SlashCommand[]>();
+  const frequentCommandKeys = new Set(frequentCommands.map(getCommandKey));
+
+  for (const command of commands) {
+    if (frequentCommandKeys.has(getCommandKey(command))) {
+      continue;
+    }
+    const namespace = getCommandNamespace(command);
+    const group = groups.get(namespace) || [];
+    group.push(command);
+    groups.set(namespace, group);
+  }
+
+  if (frequentCommands.length > 0) {
+    groups.set(
+      'frequent',
+      frequentCommands.map((command) => ({
+        ...command,
+        namespace: 'frequent',
+      })),
+    );
+  }
+
+  const extraNamespaces = [...groups.keys()].filter(
+    (namespace) => !preferredOrder.includes(namespace),
+  );
+  return [...preferredOrder, ...extraNamespaces].flatMap(
+    (namespace) => groups.get(namespace) || [],
+  );
+};
 
 export function useSlashCommands({
   selectedProject,
   input,
   setInput,
   textareaRef,
-  onExecuteCommand,
+  inputValueRef: externalInputValueRef,
 }: UseSlashCommandsOptions) {
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [filteredCommands, setFilteredCommands] = useState<SlashCommand[]>([]);
@@ -219,6 +260,29 @@ export function useSlashCommands({
       .slice(0, 5);
   }, [selectedProject, slashCommands]);
 
+  const displayedCommands = useMemo(() => {
+    return groupCommandsForDisplay(
+      filteredCommands,
+      commandQuery ? [] : frequentCommands,
+    );
+  }, [commandQuery, filteredCommands, frequentCommands]);
+
+  useEffect(() => {
+    if (!showCommandMenu) {
+      return;
+    }
+
+    setSelectedCommandIndex((previousIndex) => {
+      if (displayedCommands.length === 0) {
+        return -1;
+      }
+      if (previousIndex >= displayedCommands.length) {
+        return displayedCommands.length - 1;
+      }
+      return previousIndex;
+    });
+  }, [displayedCommands.length, showCommandMenu]);
+
   const trackCommandUsage = useCallback(
     (command: SlashCommand) => {
       if (!selectedProject) {
@@ -235,7 +299,7 @@ export function useSlashCommands({
   // Insert the picked command name into the textarea and leave the caret right
   // after `<command> `. We DO NOT auto-submit — the user reviews/edits args
   // and presses Enter themselves, mirroring how the TUI behaves and avoiding
-  // surprise sends (e.g. /add-project with no path runs blindly).
+  // surprise sends from slash suggestions that still need arguments.
   //
   // The replacement spans from the active `/` to the next whitespace so a
   // partial query like `hello /skill_inst` becomes `hello /skill_install ` and
@@ -254,6 +318,9 @@ export function useSlashCommands({
       const newInput = `${head}${textAfterQuery}`;
 
       setInput(newInput);
+      if (externalInputValueRef) {
+        externalInputValueRef.current = newInput;
+      }
       resetCommandMenuState();
 
       // Defer focus + caret placement until after React commits the new input
@@ -270,14 +337,15 @@ export function useSlashCommands({
         }
       }, 0);
     },
-    [input, slashPosition, setInput, resetCommandMenuState, textareaRef],
+    [externalInputValueRef, input, slashPosition, setInput, resetCommandMenuState, textareaRef],
   );
 
   const selectCommandFromKeyboard = useCallback(
     (command: SlashCommand) => {
+      trackCommandUsage(command);
       insertCommandIntoInput(command);
     },
-    [insertCommandIntoInput],
+    [trackCommandUsage, insertCommandIntoInput],
   );
 
   const handleCommandSelect = useCallback(
@@ -311,10 +379,33 @@ export function useSlashCommands({
   }, [showCommandMenu, slashCommands, textareaRef]);
 
   const handleCommandInputChange = useCallback(
-    () => {
-      resetCommandMenuState();
+    (value?: string, cursorPos?: number) => {
+      if (value === undefined || cursorPos === undefined) {
+        resetCommandMenuState();
+        return;
+      }
+
+      const textBeforeCursor = value.slice(0, cursorPos);
+      const slashMatch = textBeforeCursor.match(/(^|\s)(\/)(\S*)$/);
+
+      if (!slashMatch) {
+        resetCommandMenuState();
+        return;
+      }
+
+      const slashIdx = textBeforeCursor.lastIndexOf('/');
+      const query = slashMatch[3] || '';
+
+      setSlashPosition(slashIdx);
+      setShowCommandMenu(true);
+      setSelectedCommandIndex(query ? -1 : 0);
+
+      clearCommandQueryTimer();
+      commandQueryTimerRef.current = window.setTimeout(() => {
+        setCommandQuery(query);
+      }, COMMAND_QUERY_DEBOUNCE_MS);
     },
-    [resetCommandMenuState],
+    [resetCommandMenuState, clearCommandQueryTimer],
   );
 
   const handleCommandMenuKeyDown = useCallback(
@@ -323,7 +414,7 @@ export function useSlashCommands({
         return false;
       }
 
-      if (!filteredCommands.length) {
+      if (!displayedCommands.length) {
         if (event.key === 'Escape') {
           event.preventDefault();
           resetCommandMenuState();
@@ -335,7 +426,7 @@ export function useSlashCommands({
       if (event.key === 'ArrowDown') {
         event.preventDefault();
         setSelectedCommandIndex((previousIndex) =>
-          previousIndex < filteredCommands.length - 1 ? previousIndex + 1 : 0,
+          previousIndex < displayedCommands.length - 1 ? previousIndex + 1 : 0,
         );
         return true;
       }
@@ -343,7 +434,7 @@ export function useSlashCommands({
       if (event.key === 'ArrowUp') {
         event.preventDefault();
         setSelectedCommandIndex((previousIndex) =>
-          previousIndex > 0 ? previousIndex - 1 : filteredCommands.length - 1,
+          previousIndex > 0 ? previousIndex - 1 : displayedCommands.length - 1,
         );
         return true;
       }
@@ -354,9 +445,9 @@ export function useSlashCommands({
         }
         event.preventDefault();
         if (selectedCommandIndex >= 0) {
-          selectCommandFromKeyboard(filteredCommands[selectedCommandIndex]);
-        } else if (filteredCommands.length > 0) {
-          selectCommandFromKeyboard(filteredCommands[0]);
+          selectCommandFromKeyboard(displayedCommands[selectedCommandIndex]);
+        } else if (displayedCommands.length > 0) {
+          selectCommandFromKeyboard(displayedCommands[0]);
         }
         return true;
       }
@@ -369,7 +460,14 @@ export function useSlashCommands({
 
       return false;
     },
-    [showCommandMenu, filteredCommands, dismissCommandMenu, selectCommandFromKeyboard, selectedCommandIndex],
+    [
+      showCommandMenu,
+      displayedCommands,
+      resetCommandMenuState,
+      dismissCommandMenu,
+      selectCommandFromKeyboard,
+      selectedCommandIndex,
+    ],
   );
 
   useEffect(
@@ -382,7 +480,7 @@ export function useSlashCommands({
   return {
     slashCommands,
     slashCommandsCount: slashCommands.length,
-    filteredCommands,
+    filteredCommands: displayedCommands,
     frequentCommands,
     commandQuery,
     showCommandMenu,

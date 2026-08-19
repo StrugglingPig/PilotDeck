@@ -1,7 +1,11 @@
 import type { Gateway, GatewayChannelKey } from "../../../gateway/index.js";
+import type { CronResultDelivery } from "../../../cron/index.js";
 import type { ChannelAdapter, ChannelHandle, ChannelLogger, ChannelStartDeps } from "../protocol/ChannelAdapter.js";
+import { deliverChatCronResult } from "../protocol/ImCronDelivery.js";
 import { SignalSessionMapper } from "./SignalSessionMapper.js";
 import { renderSignalEvent } from "./signal-render.js";
+import { ImElicitationHelper } from "../protocol/ImElicitationHelper.js";
+import { ImPermissionHelper } from "../protocol/ImPermissionHelper.js";
 
 const MAX_MESSAGE_LENGTH = 2000;
 const DEFAULT_REST_URL = "http://127.0.0.1:8080";
@@ -70,6 +74,8 @@ export class SignalChannel implements ChannelAdapter {
   private receivePromise: Promise<void> | null = null;
   private running = false;
   private activeChats = new Set<string>();
+  private readonly elicitation = new ImElicitationHelper();
+  private readonly permissions = new ImPermissionHelper();
   private recipientByChat = new Map<string, string>();
 
   constructor(options: SignalChannelOptions = {}) {
@@ -110,6 +116,10 @@ export class SignalChannel implements ChannelAdapter {
     };
   }
 
+  async deliverCronResult(delivery: CronResultDelivery): Promise<boolean> {
+    return deliverChatCronResult(delivery, this.channelKey, (chatId, text) => this.sendReply(chatId, text));
+  }
+
   private async runReceiveLoop(signal: AbortSignal): Promise<void> {
     const url = `${this.restUrl}/v1/receive/${encodeURIComponent(this.account)}`;
     let carry = "";
@@ -141,7 +151,9 @@ export class SignalChannel implements ChannelAdapter {
           const lines = carry.split(/\r?\n/);
           carry = lines.pop() ?? "";
           for (const line of lines) {
-            await this.parseLine(line);
+            void this.parseLine(line).catch((e) => {
+              this.logger?.error?.(`signal: parseLine error: ${e}`);
+            });
           }
         }
       } catch (e) {
@@ -171,6 +183,26 @@ export class SignalChannel implements ChannelAdapter {
     const sessionChatId = chatId ?? (sourceNumber ? `dm:${sourceNumber}` : this.account);
     const recipient = sourceNumber ?? sessionChatId.replace(/^(dm:|group:)/, "");
     if (recipient) this.recipientByChat.set(sessionChatId, recipient);
+
+    if (this.elicitation.hasPending(sessionChatId) && this.gateway) {
+      try {
+        const confirmation = await this.elicitation.answer(sessionChatId, text, this.gateway);
+        if (confirmation) await this.sendReply(sessionChatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`signal: elicitation answer error: ${e}`);
+      }
+      return;
+    }
+
+    if (this.permissions.hasPending(sessionChatId) && this.gateway) {
+      try {
+        const confirmation = await this.permissions.answer(sessionChatId, text, this.gateway);
+        if (confirmation) await this.sendReply(sessionChatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`signal: permission answer error: ${e}`);
+      }
+      return;
+    }
 
     if (this.activeChats.has(sessionChatId)) {
       this.logger?.info?.(`signal: chat ${sessionChatId} already active, skipping`);
@@ -202,6 +234,16 @@ export class SignalChannel implements ChannelAdapter {
         channelKey: "signal",
         message,
       })) {
+        if (event.type === "elicitation_request") {
+          const questionText = this.elicitation.capture(chatId, sessionKey, event);
+          await this.sendReply(chatId, questionText);
+          continue;
+        }
+        if (event.type === "permission_request") {
+          const questionText = this.permissions.capture(chatId, sessionKey, event);
+          if (questionText) await this.sendReply(chatId, questionText);
+          continue;
+        }
         const fragment = renderSignalEvent(event);
         if (fragment != null) replyText += fragment;
       }
@@ -210,21 +252,25 @@ export class SignalChannel implements ChannelAdapter {
       replyText = "处理消息时发生错误，请重试。";
     }
 
+    this.elicitation.clear(chatId);
+    this.permissions.clear(chatId);
+
     const finalText = replyText.trim();
     if (finalText) {
       await this.sendReply(chatId, finalText);
     }
   }
 
-  private async sendReply(chatId: string, text: string): Promise<void> {
-    if (!this.running) return;
+  private async sendReply(chatId: string, text: string): Promise<boolean> {
+    if (!this.running) return false;
     const recipient =
       this.recipientByChat.get(chatId) ?? chatId.replace(/^(dm:|group:)/, "");
     if (!recipient) {
       this.logger?.warn?.(`signal: no recipient for ${chatId}, cannot send`);
-      return;
+      return false;
     }
     const chunks = chunkText(text, MAX_MESSAGE_LENGTH);
+    let ok = true;
     for (const chunk of chunks) {
       const body = {
         message: chunk,
@@ -240,11 +286,14 @@ export class SignalChannel implements ChannelAdapter {
         if (!res.ok) {
           const raw = await res.text().catch(() => "");
           this.logger?.error?.(`signal: send HTTP ${res.status}: ${raw.slice(0, 500)}`);
+          ok = false;
         }
       } catch (e) {
         this.logger?.error?.(`signal: send failed: ${e}`);
+        ok = false;
       }
     }
+    return ok;
   }
 
   private async sleepBackoff(signal: AbortSignal): Promise<void> {

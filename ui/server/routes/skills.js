@@ -3,14 +3,15 @@
  * contract that `ui/src/components/main-content-v2/SkillsV2.tsx` was
  * built against into the gateway's `skill_*` RPCs. The gateway is the
  * authoritative skill manager (see `src/extension/skills/SkillManager.ts`)
- * backed by `~/.pilotdeck/skills/` and `<project>/.pilotdeck/skills/`,
+ * backed by release-bundled skills, `~/.pilotdeck/skills/`, and
+ * `<project>/.pilotdeck/skills/`,
  * so the UI and the agent always read from the same place.
  *
  * Two endpoints stay file-based for now because they don't map cleanly
  * onto a single gateway RPC:
  *
  *   - `/import-upload` — multipart browser folder picker. We stream the
- *     buffers into the project skill dir directly, then ask the gateway
+ *     buffers into a staging dir next to the target skill root, then ask the gateway
  *     to refresh its in-memory caches via a follow-up `skill_validate`
  *     call to compute the validation result. A future revision can lift
  *     this onto a gateway RPC that accepts base64 chunks.
@@ -29,11 +30,13 @@ import express from 'express';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import multer from 'multer';
 import { getPilotDeckGateway } from '../pilotdeck-bridge.js';
 import { resolvePilotHome } from '../utils/pilotPaths.js';
+import { moveDirectoryAcrossDevicesSafe } from '../utils/fileMoves.js';
 
 const execFileAsync = promisify(execFile);
 const router = express.Router();
@@ -58,6 +61,10 @@ const SLUG_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$/;
 const PILOT_HOME = resolvePilotHome(process.env);
 const PROJECT_DIR = '.pilotdeck';
 const SKILLS_SUBDIR = 'skills';
+const BUNDLED_SKILLS_ROOT = path.resolve(
+  process.env.PILOTDECK_BUNDLED_SKILLS_DIR ||
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'skills'),
+);
 
 function safeSlug(slug) {
   return typeof slug === 'string' && SLUG_RE.test(slug) && !slug.includes('..');
@@ -73,6 +80,10 @@ function isGeneralCwd(projectPath) {
 function resolveRequestedScope(scope, projectPath, { defaultToProjectWhenAvailable = false } = {}) {
   const generalCwd = isGeneralCwd(projectPath);
   const effectiveProjectPath = generalCwd ? null : projectPath || null;
+
+  if (scope === 'builtin') {
+    return { ok: false, error: 'built-in skills are read-only' };
+  }
 
   if (scope === 'project') {
     if (generalCwd) {
@@ -129,7 +140,10 @@ function classifySkillPath(skillPath, projectPath = null) {
     return { ok: false, reason: 'skillPath contains ".."' };
   }
 
-  const candidates = [{ root: userSkillsRoot(), scope: 'user' }];
+  const candidates = [
+    { root: BUNDLED_SKILLS_ROOT, scope: 'builtin' },
+    { root: userSkillsRoot(), scope: 'user' },
+  ];
   if (projectPath && !isGeneralCwd(projectPath)) {
     candidates.push({ root: projectSkillsRoot(projectPath), scope: 'project' });
   }
@@ -168,6 +182,8 @@ function sendGatewayError(res, err) {
     case 'project_required':
     case 'self_import':
       return res.status(400).json({ error: message, code });
+    case 'read_only':
+      return res.status(403).json({ error: message, code });
     case 'not_found':
     case 'source_missing':
     case 'source_not_directory':
@@ -203,15 +219,25 @@ async function callGateway(method, params) {
 
 router.post('/list', async (req, res) => {
   try {
-    const { projectPath } = req.body || {};
-    const generalCwd = isGeneralCwd(projectPath);
-    const effectiveProjectPath = generalCwd ? null : projectPath || null;
-    const data = await callGateway('skillsList', { projectKey: effectiveProjectPath });
+    const { projectPath, projectKey, query, scope, cursor, limit } = req.body || {};
+    const requestedProject = projectKey || projectPath;
+    const generalCwd = isGeneralCwd(requestedProject);
+    const effectiveProjectPath = generalCwd ? null : requestedProject || null;
+    const data = await callGateway('skillsList', {
+      projectKey: effectiveProjectPath,
+      query,
+      scope,
+      cursor,
+      limit,
+    });
     res.json({
+      builtin: data.builtin,
       user: data.user,
       project: data.project,
       projectPath: data.projectPath,
       isGeneralCwd: generalCwd,
+      items: data.items,
+      nextCursor: data.nextCursor,
     });
   } catch (e) {
     sendGatewayError(res, e);
@@ -417,7 +443,8 @@ router.post('/import-upload', upload.array('files', 500), async (req, res) => {
       }
     }
 
-    stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), 'skill-upload-'));
+    await fs.mkdir(root, { recursive: true });
+    stagingDir = await fs.mkdtemp(path.join(root, '.tmp-skill-upload-'));
     for (const m of manifest) {
       const rel =
         stripPrefix && m.relativePath.startsWith(stripPrefix)
@@ -428,9 +455,8 @@ router.post('/import-upload', upload.array('files', 500), async (req, res) => {
       await fs.mkdir(path.dirname(out), { recursive: true });
       await fs.writeFile(out, m.buffer);
     }
-    await fs.mkdir(root, { recursive: true });
     if (exists) await fs.rm(targetDir, { recursive: true, force: true });
-    await fs.rename(stagingDir, targetDir);
+    await moveDirectoryAcrossDevicesSafe(stagingDir, targetDir);
     stagingDir = null;
 
     // Round-trip through the gateway once more so the response shape

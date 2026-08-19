@@ -2,9 +2,13 @@ import * as http from "node:http";
 import * as crypto from "node:crypto";
 import { URL } from "node:url";
 import type { Gateway, GatewayChannelKey } from "../../../gateway/index.js";
+import type { CronResultDelivery } from "../../../cron/index.js";
 import type { ChannelAdapter, ChannelHandle, ChannelLogger, ChannelStartDeps } from "../protocol/ChannelAdapter.js";
+import { deliverChatCronResult } from "../protocol/ImCronDelivery.js";
 import { WeComCallbackSessionMapper } from "./WeComCallbackSessionMapper.js";
 import { renderWeComCallbackEvent } from "./wecom-callback-render.js";
+import { ImElicitationHelper } from "../protocol/ImElicitationHelper.js";
+import { ImPermissionHelper } from "../protocol/ImPermissionHelper.js";
 
 const QYAPI = "https://qyapi.weixin.qq.com/cgi-bin";
 const DEFAULT_PORT = 8780;
@@ -88,6 +92,8 @@ export class WeComCallbackChannel implements ChannelAdapter {
   private accessToken: string | null = null;
   private accessTokenExpires = 0;
   private activeChats = new Set<string>();
+  private readonly elicitation = new ImElicitationHelper();
+  private readonly permissions = new ImPermissionHelper();
 
   constructor(options: WeComCallbackChannelOptions = {}) {
     this.mapper = options.mapper ?? new WeComCallbackSessionMapper();
@@ -136,6 +142,10 @@ export class WeComCallbackChannel implements ChannelAdapter {
         }
       },
     };
+  }
+
+  async deliverCronResult(delivery: CronResultDelivery): Promise<boolean> {
+    return deliverChatCronResult(delivery, this.channelKey, (chatId, text) => this.sendReply(chatId, text));
   }
 
   private async onHttp(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -203,6 +213,26 @@ export class WeComCallbackChannel implements ChannelAdapter {
 
     const chatId = from;
 
+    if (this.elicitation.hasPending(chatId) && this.gateway) {
+      try {
+        const confirmation = await this.elicitation.answer(chatId, text, this.gateway);
+        if (confirmation) await this.sendReply(chatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`wecom_callback: elicitation answer error: ${e}`);
+      }
+      return;
+    }
+
+    if (this.permissions.hasPending(chatId) && this.gateway) {
+      try {
+        const confirmation = await this.permissions.answer(chatId, text, this.gateway);
+        if (confirmation) await this.sendReply(chatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`wecom_callback: permission answer error: ${e}`);
+      }
+      return;
+    }
+
     if (this.activeChats.has(chatId)) {
       this.logger?.info?.(`wecom_callback: chat ${chatId} already active, skipping`);
       return;
@@ -233,6 +263,16 @@ export class WeComCallbackChannel implements ChannelAdapter {
         channelKey: "wecom_callback",
         message,
       })) {
+        if (event.type === "elicitation_request") {
+          const questionText = this.elicitation.capture(chatId, sessionKey, event);
+          await this.sendReply(chatId, questionText);
+          continue;
+        }
+        if (event.type === "permission_request") {
+          const questionText = this.permissions.capture(chatId, sessionKey, event);
+          if (questionText) await this.sendReply(chatId, questionText);
+          continue;
+        }
         const fragment = renderWeComCallbackEvent(event);
         if (fragment != null) replyText += fragment;
       }
@@ -241,13 +281,16 @@ export class WeComCallbackChannel implements ChannelAdapter {
       replyText = "处理消息时发生错误，请重试。";
     }
 
+    this.elicitation.clear(chatId);
+    this.permissions.clear(chatId);
+
     const finalText = replyText.trim();
     if (finalText) {
       await this.sendReply(chatId, finalText);
     }
   }
 
-  private async sendReply(chatId: string, text: string): Promise<void> {
+  private async sendReply(chatId: string, text: string): Promise<boolean> {
     try {
       const token = await this.getAccessToken();
       const url = `${QYAPI}/message/send?access_token=${encodeURIComponent(token)}`;
@@ -271,9 +314,12 @@ export class WeComCallbackChannel implements ChannelAdapter {
         if (errcode === 40014 || errcode === 42001) {
           this.accessToken = null;
         }
+        return false;
       }
+      return true;
     } catch (e) {
       this.logger?.error?.(`wecom_callback: sendReply error: ${e}`);
+      return false;
     }
   }
 

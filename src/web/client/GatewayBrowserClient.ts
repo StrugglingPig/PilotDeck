@@ -61,6 +61,8 @@ export class GatewayBrowserClient {
   private readonly streams = new Map<string, AsyncEventQueue<WebGatewayEvent>>();
   private connectError?: Error;
   private closed = false;
+  private helloResolve?: (hello: WebHelloOk) => void;
+  private helloReject?: (error: Error) => void;
 
   constructor(private readonly options: GatewayBrowserClientOptions) {}
 
@@ -136,7 +138,7 @@ export class GatewayBrowserClient {
   }
 
   /** Convenience helpers. */
-  abortTurn(input: { sessionKey: string; runId?: string }): Promise<{ ok: boolean }> {
+  abortTurn(input: { sessionKey: string; runId?: string; reason?: string }): Promise<{ ok: boolean }> {
     return this.request<{ ok: boolean }>("abort_turn", input);
   }
 
@@ -168,6 +170,30 @@ export class GatewayBrowserClient {
       "describe_server",
       {},
     );
+  }
+
+  projectFilesList(input: import("./protocol.js").WebProjectFilesListInput) {
+    return this.request<import("./protocol.js").WebProjectFilesListResult>("project_files_list", input);
+  }
+
+  commandsList(input: import("./protocol.js").WebCommandsListInput) {
+    return this.request<import("./protocol.js").WebCommandsListResult>("commands_list", input);
+  }
+
+  modelCatalogList(input: import("./protocol.js").WebModelCatalogListInput) {
+    return this.request<import("./protocol.js").WebModelCatalogListResult>("model_catalog_list", input);
+  }
+
+  sessionModelGet(input: import("./protocol.js").WebSessionModelInput) {
+    return this.request<import("./protocol.js").WebSessionModelResult>("session_model_get", input);
+  }
+
+  sessionModelSet(input: import("./protocol.js").WebSessionModelInput & { selection: import("./protocol.js").WebSessionModelSelection }) {
+    return this.request<import("./protocol.js").WebSessionModelResult>("session_model_set", input);
+  }
+
+  sessionModelClear(input: import("./protocol.js").WebSessionModelInput) {
+    return this.request<{ ok: boolean }>("session_model_clear", input);
   }
 
   getActiveTurnSnapshot(input: import("./protocol.js").WebActiveTurnSnapshotInput) {
@@ -202,6 +228,15 @@ export class GatewayBrowserClient {
     );
   }
 
+  readSubagentMessages(
+    input: import("./protocol.js").WebReadSubagentMessagesInput,
+  ) {
+    return this.request<import("./protocol.js").WebReadSubagentMessagesResult>(
+      "read_subagent_messages",
+      input,
+    );
+  }
+
   listProjects(): Promise<import("./protocol.js").WebListProjectsResult> {
     return this.request<import("./protocol.js").WebListProjectsResult>("list_projects", {});
   }
@@ -215,6 +250,9 @@ export class GatewayBrowserClient {
   }
   cronList(input: unknown) {
     return this.request<unknown>("cron_list", input);
+  }
+  cronUpdate(input: unknown) {
+    return this.request<unknown>("cron_update", input);
   }
   cronDelete(input: unknown) {
     return this.request<unknown>("cron_delete", input);
@@ -251,18 +289,32 @@ export class GatewayBrowserClient {
     this.ws.send(JSON.stringify(frame));
   }
 
-  private async waitForHello(timeoutMs: number): Promise<WebHelloOk> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      if (this.hello) {
-        return this.hello;
-      }
-      if (this.connectError || this.closed) {
-        throw this.connectError ?? new Error("Gateway WebSocket closed before hello.");
-      }
-      await sleep(10);
+  private waitForHello(timeoutMs: number): Promise<WebHelloOk> {
+    if (this.hello) return Promise.resolve(this.hello);
+    if (this.connectError || this.closed) {
+      return Promise.reject(
+        this.connectError ?? new Error("Gateway WebSocket closed before hello."),
+      );
     }
-    throw new Error("Gateway hello timed out.");
+    return new Promise<WebHelloOk>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.helloResolve = undefined;
+        this.helloReject = undefined;
+        reject(new Error("Gateway hello timed out."));
+      }, timeoutMs);
+      this.helloResolve = (hello) => {
+        clearTimeout(timer);
+        this.helloResolve = undefined;
+        this.helloReject = undefined;
+        resolve(hello);
+      };
+      this.helloReject = (err) => {
+        clearTimeout(timer);
+        this.helloResolve = undefined;
+        this.helloReject = undefined;
+        reject(err);
+      };
+    });
   }
 
   private ensureConnected(): void {
@@ -283,6 +335,7 @@ export class GatewayBrowserClient {
     }
     if ((frame as WebHelloOk).type === "hello_ok") {
       this.hello = frame as WebHelloOk;
+      this.helloResolve?.(this.hello);
       return;
     }
     if (frame.type === "response") {
@@ -293,7 +346,7 @@ export class GatewayBrowserClient {
         pending.resolve(frame.result);
       } else {
         pending.reject(
-          Object.assign(new Error(frame.error.message), { code: frame.error.code }),
+          Object.assign(new Error(frame.error.message), { code: frame.error.code, details: frame.error.details }),
         );
       }
       return;
@@ -326,6 +379,7 @@ export class GatewayBrowserClient {
     );
     if (!this.hello) {
       this.connectError ??= error;
+      this.helloReject?.(error);
     }
     this.failPendingAndStreams(error);
   }
@@ -441,8 +495,4 @@ function waitForOpen(ws: WebSocketLike): Promise<void> {
     ws.addEventListener("open", onOpen, { once: true });
     ws.addEventListener("error", onError, { once: true });
   });
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

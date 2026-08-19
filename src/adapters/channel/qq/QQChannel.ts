@@ -1,7 +1,9 @@
 import type { Gateway, GatewayChannelKey } from "../../../gateway/index.js";
 import type { ChannelAdapter, ChannelHandle, ChannelLogger, ChannelStartDeps } from "../protocol/ChannelAdapter.js";
 import { QQBotGateway, type QQBotCredentials, type QQGroupMessageEvent, type QQC2CMessageEvent } from "./qqbot-gateway.js";
-import { QQSessionMapper } from "./QQSessionMapper.js";
+import { ImElicitationHelper } from "../protocol/ImElicitationHelper.js";
+import { ImPermissionHelper } from "../protocol/ImPermissionHelper.js";
+import { QQSessionMapper, type QQSessionMapperState } from "./QQSessionMapper.js";
 import { renderQQEvent } from "./qq-render.js";
 
 export type QQChannelOptions = {
@@ -11,6 +13,7 @@ export type QQChannelOptions = {
   triggerPrefixes?: string[];
   mapper?: QQSessionMapper;
   maxMessageLength?: number;
+  onStateChange?: (state: QQSessionMapperState) => void;
 };
 
 const DEFAULT_PREFIXES = ["/ask", "/chat"];
@@ -24,11 +27,14 @@ export class QQChannel implements ChannelAdapter {
   private readonly triggerPrefixes: string[];
   private readonly mapper: QQSessionMapper;
   private readonly maxMessageLength: number;
+  private readonly onStateChange?: (state: QQSessionMapperState) => void;
 
   private gateway?: Gateway;
   private logger?: ChannelLogger;
   private botGateway?: QQBotGateway;
   private activeChats = new Set<string>();
+  private readonly elicitation = new ImElicitationHelper();
+  private readonly permissions = new ImPermissionHelper();
 
   constructor(options: QQChannelOptions = {}) {
     this.credentials = {
@@ -39,6 +45,7 @@ export class QQChannel implements ChannelAdapter {
     this.triggerPrefixes = options.triggerPrefixes ?? DEFAULT_PREFIXES;
     this.mapper = options.mapper ?? new QQSessionMapper();
     this.maxMessageLength = options.maxMessageLength ?? DEFAULT_MAX_MSG_LEN;
+    this.onStateChange = options.onStateChange;
   }
 
   async start(deps: ChannelStartDeps): Promise<ChannelHandle> {
@@ -120,12 +127,36 @@ export class QQChannel implements ChannelAdapter {
     if (!text) return;
 
     const chatKey = `${groupOpenId}:${userOpenId}`;
+
+    if (this.elicitation.hasPending(chatKey) && this.gateway) {
+      try {
+        const confirmation = await this.elicitation.answer(chatKey, text, this.gateway);
+        if (confirmation) await this.sendReply(groupOpenId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`qq: elicitation answer error: ${e}`);
+      }
+      return;
+    }
+
+    if (this.permissions.hasPending(chatKey) && this.gateway) {
+      try {
+        const confirmation = await this.permissions.answer(chatKey, text, this.gateway);
+        if (confirmation) await this.sendReply(groupOpenId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`qq: permission answer error: ${e}`);
+      }
+      return;
+    }
+
     if (this.activeChats.has(chatKey)) {
       this.logger?.info?.(`qq: chat ${chatKey} already active, skipping`);
       return;
     }
 
     const mapped = this.mapper.resolve({ groupId: groupOpenId, userId: userOpenId, text });
+    if (mapped.command === "new") {
+      this.onStateChange?.(this.mapper.snapshot());
+    }
 
     if (mapped.command === "new" && !mapped.message) {
       await this.sendReply(groupOpenId, "已创建新会话。", event.id);
@@ -136,7 +167,7 @@ export class QQChannel implements ChannelAdapter {
 
     this.activeChats.add(chatKey);
     try {
-      await this.processMessage(groupOpenId, mapped.sessionKey, mapped.message, event.id);
+      await this.processMessage(chatKey, groupOpenId, mapped.sessionKey, mapped.message, event.id);
     } finally {
       this.activeChats.delete(chatKey);
     }
@@ -150,6 +181,27 @@ export class QQChannel implements ChannelAdapter {
     if (!rawText) return;
 
     const chatKey = `c2c:${userOpenId}`;
+
+    if (this.elicitation.hasPending(chatKey) && this.gateway) {
+      try {
+        const confirmation = await this.elicitation.answer(chatKey, rawText, this.gateway);
+        if (confirmation) await this.sendC2CReply(userOpenId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`qq: elicitation answer error (c2c): ${e}`);
+      }
+      return;
+    }
+
+    if (this.permissions.hasPending(chatKey) && this.gateway) {
+      try {
+        const confirmation = await this.permissions.answer(chatKey, rawText, this.gateway);
+        if (confirmation) await this.sendC2CReply(userOpenId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`qq: permission answer error (c2c): ${e}`);
+      }
+      return;
+    }
+
     if (this.activeChats.has(chatKey)) {
       this.logger?.info?.(`qq: c2c ${chatKey} already active, skipping`);
       return;
@@ -171,6 +223,7 @@ export class QQChannel implements ChannelAdapter {
     msgId: string,
   ): Promise<void> {
     if (!this.gateway) return;
+    const chatKey = `c2c:${userOpenId}`;
 
     let replyText = "";
     try {
@@ -179,6 +232,16 @@ export class QQChannel implements ChannelAdapter {
         channelKey: "qq",
         message,
       })) {
+        if (event.type === "elicitation_request") {
+          const questionText = this.elicitation.capture(chatKey, sessionKey, event);
+          await this.sendC2CReplyChunked(userOpenId, questionText, msgId);
+          continue;
+        }
+        if (event.type === "permission_request") {
+          const questionText = this.permissions.capture(chatKey, sessionKey, event);
+          if (questionText) await this.sendC2CReplyChunked(userOpenId, questionText, msgId);
+          continue;
+        }
         const fragment = renderQQEvent(event);
         if (fragment != null) replyText += fragment;
       }
@@ -187,6 +250,8 @@ export class QQChannel implements ChannelAdapter {
       replyText = "处理消息时发生错误，请重试。";
     }
 
+    this.elicitation.clear(chatKey);
+    this.permissions.clear(chatKey);
     const finalText = replyText.trim();
     if (finalText) {
       await this.sendC2CReplyChunked(userOpenId, finalText, msgId);
@@ -224,6 +289,7 @@ export class QQChannel implements ChannelAdapter {
   }
 
   private async processMessage(
+    chatKey: string,
     groupOpenId: string,
     sessionKey: string,
     message: string,
@@ -238,6 +304,16 @@ export class QQChannel implements ChannelAdapter {
         channelKey: "qq",
         message,
       })) {
+        if (event.type === "elicitation_request") {
+          const questionText = this.elicitation.capture(chatKey, sessionKey, event);
+          await this.sendReplyChunked(groupOpenId, questionText, msgId);
+          continue;
+        }
+        if (event.type === "permission_request") {
+          const questionText = this.permissions.capture(chatKey, sessionKey, event);
+          if (questionText) await this.sendReplyChunked(groupOpenId, questionText, msgId);
+          continue;
+        }
         const fragment = renderQQEvent(event);
         if (fragment != null) replyText += fragment;
       }
@@ -246,6 +322,8 @@ export class QQChannel implements ChannelAdapter {
       replyText = "处理消息时发生错误，请重试。";
     }
 
+    this.elicitation.clear(chatKey);
+    this.permissions.clear(chatKey);
     const finalText = replyText.trim();
     if (finalText) {
       await this.sendReplyChunked(groupOpenId, finalText, msgId);

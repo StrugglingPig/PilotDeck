@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Clock,
   FileText,
+  GitMerge,
   Loader2,
   Play,
   RefreshCw,
@@ -48,6 +49,12 @@ const PHASE_META: Record<
     labelKey: 'dashboard.phase.noPlan',
     defaultLabel: 'No Plan',
   },
+  workspace_started: {
+    icon: Loader2,
+    color: 'text-amber-500 dark:text-amber-400',
+    labelKey: 'dashboard.phase.workspaceStarted',
+    defaultLabel: 'Workspace Preparing',
+  },
   workspace_ready: {
     icon: Zap,
     color: 'text-amber-500 dark:text-amber-400',
@@ -66,11 +73,29 @@ const PHASE_META: Record<
     labelKey: 'dashboard.phase.executionCompleted',
     defaultLabel: 'Execution Completed',
   },
+  report_started: {
+    icon: FileText,
+    color: 'text-purple-500 dark:text-purple-400',
+    labelKey: 'dashboard.phase.reportStarted',
+    defaultLabel: 'Report Generating',
+  },
   report_produced: {
     icon: Sparkles,
     color: 'text-purple-600 dark:text-purple-400',
     labelKey: 'dashboard.phase.reportProduced',
     defaultLabel: 'Report Produced',
+  },
+  apply_started: {
+    icon: GitMerge,
+    color: 'text-indigo-500 dark:text-indigo-400',
+    labelKey: 'dashboard.phase.applyStarted',
+    defaultLabel: 'Apply Started',
+  },
+  apply_completed: {
+    icon: CheckCircle2,
+    color: 'text-emerald-600 dark:text-emerald-400',
+    labelKey: 'dashboard.phase.applyCompleted',
+    defaultLabel: 'Apply Completed',
   },
   run_completed: {
     icon: CheckCircle2,
@@ -105,7 +130,9 @@ const PHASE_META: Record<
 };
 
 function formatRelativeTime(iso: string): string {
-  const diff = Date.now() - Date.parse(iso);
+  const parsed = Date.parse(iso);
+  if (Number.isNaN(parsed)) return '—';
+  const diff = Math.max(0, Date.now() - parsed);
   const sec = Math.round(diff / 1000);
   if (sec < 60) return 'just now';
   const min = Math.round(sec / 60);
@@ -163,9 +190,10 @@ function getEventClickAction(phase: AlwaysOnDashboardEventPhase): EventClickActi
 
 type AlwaysOnDashboardProps = {
   onOpenExecutionSession?: (projectKey: string, runId: string, projectName?: string) => void;
+  compact?: boolean;
 };
 
-export default function AlwaysOnDashboard({ onOpenExecutionSession }: AlwaysOnDashboardProps) {
+export default function AlwaysOnDashboard({ onOpenExecutionSession, compact = false }: AlwaysOnDashboardProps) {
   const { t } = useTranslation('alwaysOn');
   const [events, setEvents] = useState<AlwaysOnDashboardEvent[]>([]);
   const [loading, setLoading] = useState(false);
@@ -217,7 +245,7 @@ export default function AlwaysOnDashboard({ onOpenExecutionSession }: AlwaysOnDa
 
     let todayEvents = 0;
     const activeProjects = new Set<string>();
-    let runningCount = 0;
+    const runningRuns = new Set<string>();
 
     for (const event of events) {
       if (Date.parse(event.timestamp) >= todayMs) {
@@ -232,11 +260,11 @@ export default function AlwaysOnDashboard({ onOpenExecutionSession }: AlwaysOnDa
         const hasTerminal = events.some(
           (e) => e.runId === event.runId && isTerminalPhase(e.phase),
         );
-        if (!hasTerminal) runningCount++;
+        if (!hasTerminal) runningRuns.add(event.runId);
       }
     }
 
-    return { todayEvents, activeProjectCount: activeProjects.size, runningCount };
+    return { todayEvents, activeProjectCount: activeProjects.size, runningCount: runningRuns.size };
   }, [events]);
 
   const handleEventClick = useCallback(
@@ -258,13 +286,14 @@ export default function AlwaysOnDashboard({ onOpenExecutionSession }: AlwaysOnDa
         events={events}
         onBack={() => setSelectedRunId(null)}
         onOpenExecutionSession={onOpenExecutionSession}
+        compact={compact}
       />
     );
   }
 
   return (
-    <div className="w-full space-y-5 px-8 py-5">
-      <div className="flex items-start justify-between">
+    <div className={cn('w-full space-y-5 py-5', compact ? 'px-4' : 'px-8')}>
+      <div className={cn('flex items-start justify-between gap-3', compact && 'flex-col')}>
         <div>
           <h2 className="text-[20px] font-semibold tracking-tight text-neutral-900 dark:text-neutral-100">
             {t('dashboard.title', { defaultValue: 'Always-On Dashboard' })}
@@ -285,7 +314,7 @@ export default function AlwaysOnDashboard({ onOpenExecutionSession }: AlwaysOnDa
       </div>
 
       {/* Stats cards */}
-      <div className="grid grid-cols-3 gap-3">
+      <div className={cn('grid gap-3', compact ? 'grid-cols-1' : 'grid-cols-3')}>
         <div className="rounded-lg border border-neutral-200 p-3.5 dark:border-neutral-800">
           <div className="text-xxs font-medium uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
             {t('dashboard.stats.todayEvents', { defaultValue: 'Today\'s Events' })}

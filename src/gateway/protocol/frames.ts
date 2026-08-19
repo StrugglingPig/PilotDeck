@@ -24,10 +24,18 @@ export type WsGatewayMethod =
   | "resume_session"
   | "new_session"
   | "close_session"
+  | "record_agent_status_message"
   | "describe_server"
+  | "project_files_list"
+  | "commands_list"
+  | "model_catalog_list"
+  | "session_model_get"
+  | "session_model_set"
+  | "session_model_clear"
   | "active_turn_snapshot"
   | "cron_create"
   | "cron_list"
+  | "cron_update"
   | "cron_delete"
   | "cron_stop"
   | "cron_run_now"
@@ -35,9 +43,12 @@ export type WsGatewayMethod =
   | "permission_decide"
   | "grant_session_permission"
   | "read_session_messages"
+  | "read_subagent_messages"
+  | "fork_session"
   | "list_projects"
   | "describe_project"
   | "reload_config"
+  | "prepare_weixin_login"
   | "reload_extensions"
   | "skill_list"
   | "skill_read"
@@ -68,7 +79,7 @@ export type WsResponseFrame =
       type: "response";
       id: string;
       ok: false;
-      error: { code: string; message: string };
+      error: { code: string; message: string; validation?: unknown; details?: unknown };
     };
 
 export type WsEventFrame = {

@@ -47,6 +47,13 @@ type ParsedTodoItem = {
   status: 'pending' | 'in_progress' | 'completed';
 };
 
+type SearchToolResultData = {
+  files?: unknown;
+  filenames?: unknown;
+  count?: unknown;
+  numFiles?: unknown;
+};
+
 const TODO_LINE_PATTERN = /^\s*[-*]\s+\[( |x|X)\]\s+(.*?)\s*$/u;
 
 function parseTodoMarkdown(markdown: unknown): ParsedTodoItem[] {
@@ -85,6 +92,26 @@ function parseTodoMarkdown(markdown: unknown): ParsedTodoItem[] {
   });
 }
 
+export function getSearchToolResultFiles(result: unknown): unknown[] {
+  const toolData = ((result as { toolUseResult?: SearchToolResultData } | undefined)?.toolUseResult || {}) as SearchToolResultData;
+  if (Array.isArray(toolData.files)) return toolData.files;
+  if (Array.isArray(toolData.filenames)) return toolData.filenames;
+  return [];
+}
+
+export function getSearchToolResultCount(result: unknown): number {
+  const toolData = ((result as { toolUseResult?: SearchToolResultData } | undefined)?.toolUseResult || {}) as SearchToolResultData;
+  if (typeof toolData.count === 'number') return toolData.count;
+  if (typeof toolData.numFiles === 'number') return toolData.numFiles;
+  return getSearchToolResultFiles(result).length;
+}
+
+export function getSearchToolResultFileCount(result: unknown): number {
+  const toolData = ((result as { toolUseResult?: SearchToolResultData } | undefined)?.toolUseResult || {}) as SearchToolResultData;
+  if (typeof toolData.numFiles === 'number') return toolData.numFiles;
+  return getSearchToolResultFiles(result).length;
+}
+
 export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
   // ============================================================================
   // COMMAND TOOLS
@@ -108,8 +135,19 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
       }
     },
     result: {
-      hideOnSuccess: true,
-      type: 'special'
+      type: 'collapsible',
+      title: (data) => {
+        const content = typeof data === 'string' ? data : data?.content;
+        if (!content) return 'Output (empty)';
+        const lines = content.split('\n').length;
+        return `Output (${lines} line${lines > 1 ? 's' : ''})`;
+      },
+      defaultOpen: false,
+      contentType: 'text',
+      getContentProps: (data) => {
+        const content = typeof data === 'string' ? data : data?.content || '';
+        return { content };
+      }
     }
   },
 
@@ -227,15 +265,13 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
       type: 'collapsible',
       defaultOpen: false,
       title: (result) => {
-        const toolData = result.toolUseResult || {};
-        const count = toolData.numFiles || toolData.filenames?.length || 0;
+        const count = getSearchToolResultFileCount(result);
         return `Found ${count} ${count === 1 ? 'file' : 'files'}`;
       },
       contentType: 'file-list',
       getContentProps: (result) => {
-        const toolData = result.toolUseResult || {};
         return {
-          files: toolData.filenames || []
+          files: getSearchToolResultFiles(result)
         };
       }
     }
@@ -260,15 +296,13 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
       type: 'collapsible',
       defaultOpen: false,
       title: (result) => {
-        const toolData = result.toolUseResult || {};
-        const count = toolData.numFiles || toolData.filenames?.length || 0;
+        const count = getSearchToolResultCount(result);
         return `Found ${count} ${count === 1 ? 'file' : 'files'}`;
       },
       contentType: 'file-list',
       getContentProps: (result) => {
-        const toolData = result.toolUseResult || {};
         return {
-          files: toolData.filenames || []
+          files: getSearchToolResultFiles(result)
         };
       }
     }
@@ -626,14 +660,16 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
   AskUserQuestion: {
     input: {
       type: 'collapsible',
-      title: (input: any) => {
+      title: (input: any, helpers?: any) => {
         const questions = Array.isArray(input.questions) ? input.questions : [];
         const count = questions.length;
+        const resultAnswers = helpers?.toolResult?.toolUseResult?.answers;
+        const answers = input.answers || resultAnswers;
         const hasAnswers =
-          input.answers &&
-          typeof input.answers === 'object' &&
-          !Array.isArray(input.answers) &&
-          Object.keys(input.answers).length > 0;
+          answers &&
+          typeof answers === 'object' &&
+          !Array.isArray(answers) &&
+          Object.keys(answers).length > 0;
         if (count === 1) {
           const header = questions[0]?.header || 'Question';
           return hasAnswers ? `${header} — answered` : header;
@@ -645,10 +681,13 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
       },
       defaultOpen: true,
       contentType: 'question-answer',
-      getContentProps: (input: any) => ({
-        questions: input.questions,
-        answers: input.answers || {}
-      }),
+      getContentProps: (input: any, helpers?: any) => {
+        const resultAnswers = helpers?.toolResult?.toolUseResult?.answers;
+        return {
+          questions: input.questions,
+          answers: input.answers || resultAnswers || {},
+        };
+      },
     },
     result: {
       hideOnSuccess: true
@@ -746,8 +785,10 @@ export function shouldHideToolResult(toolName: string, toolResult: any): boolean
 
   if (!config.result) return false;
 
-  // Always hidden
-  if (config.result.hidden) return true;
+  // Hide successful noise (for example read_file content already appears in
+  // the model context), but never hide failures: users need the exact tool
+  // error and recovery hint to understand why the turn got stuck.
+  if (config.result.hidden && !toolResult?.isError) return true;
 
   // Hide on success only
   if (config.result.hideOnSuccess && toolResult && !toolResult.isError) {

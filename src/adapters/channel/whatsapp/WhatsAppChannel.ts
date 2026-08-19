@@ -1,6 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Gateway, GatewayChannelKey } from "../../../gateway/index.js";
+import type { CronResultDelivery } from "../../../cron/index.js";
 import type { ChannelAdapter, ChannelHandle, ChannelLogger, ChannelStartDeps } from "../protocol/ChannelAdapter.js";
+import { deliverChatCronResult } from "../protocol/ImCronDelivery.js";
+import { ImElicitationHelper } from "../protocol/ImElicitationHelper.js";
+import { ImPermissionHelper } from "../protocol/ImPermissionHelper.js";
 import { WhatsAppSessionMapper } from "./WhatsAppSessionMapper.js";
 import { renderWhatsAppEvent } from "./whatsapp-render.js";
 
@@ -38,6 +42,8 @@ export class WhatsAppChannel implements ChannelAdapter {
   private pollAbort = new AbortController();
   private seenIds = new Set<string>();
   private activeChats = new Set<string>();
+  private readonly elicitation = new ImElicitationHelper();
+  private readonly permissions = new ImPermissionHelper();
   private running = false;
 
   constructor(options: WhatsAppChannelOptions = {}) {
@@ -125,6 +131,10 @@ export class WhatsAppChannel implements ChannelAdapter {
     }
   }
 
+  async deliverCronResult(delivery: CronResultDelivery): Promise<boolean> {
+    return deliverChatCronResult(delivery, this.channelKey, (chatId, text) => this.sendReply(chatId, text));
+  }
+
   private async waitForBridgeReady(timeoutMs: number): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -187,6 +197,26 @@ export class WhatsAppChannel implements ChannelAdapter {
   private async dispatch(msg: InboundMessage): Promise<void> {
     if (!msg.text) return;
 
+    if (this.elicitation.hasPending(msg.chatId) && this.gateway) {
+      try {
+        const confirmation = await this.elicitation.answer(msg.chatId, msg.text, this.gateway);
+        if (confirmation) await this.sendReply(msg.chatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`whatsapp: elicitation answer error: ${e}`);
+      }
+      return;
+    }
+
+    if (this.permissions.hasPending(msg.chatId) && this.gateway) {
+      try {
+        const confirmation = await this.permissions.answer(msg.chatId, msg.text, this.gateway);
+        if (confirmation) await this.sendReply(msg.chatId, confirmation);
+      } catch (e) {
+        this.logger?.error?.(`whatsapp: permission answer error: ${e}`);
+      }
+      return;
+    }
+
     if (this.activeChats.has(msg.chatId)) {
       this.logger?.info?.(`whatsapp: chat ${msg.chatId} already active, skipping`);
       return;
@@ -217,6 +247,16 @@ export class WhatsAppChannel implements ChannelAdapter {
         channelKey: "whatsapp",
         message,
       })) {
+        if (event.type === "elicitation_request") {
+          const questionText = this.elicitation.capture(chatId, sessionKey, event);
+          await this.sendReply(chatId, questionText);
+          continue;
+        }
+        if (event.type === "permission_request") {
+          const questionText = this.permissions.capture(chatId, sessionKey, event);
+          if (questionText) await this.sendReply(chatId, questionText);
+          continue;
+        }
         const fragment = renderWhatsAppEvent(event);
         if (fragment != null) replyText += fragment;
       }
@@ -225,14 +265,16 @@ export class WhatsAppChannel implements ChannelAdapter {
       replyText = "处理消息时发生错误，请重试。";
     }
 
+    this.elicitation.clear(chatId);
+    this.permissions.clear(chatId);
     const finalText = replyText.trim();
     if (finalText) {
       await this.sendReply(chatId, finalText);
     }
   }
 
-  private async sendReply(chatId: string, text: string): Promise<void> {
-    if (!this.running) return;
+  private async sendReply(chatId: string, text: string): Promise<boolean> {
+    if (!this.running) return false;
     try {
       const res = await fetch(`${this.bridgeUrl}/send`, {
         method: "POST",
@@ -244,9 +286,12 @@ export class WhatsAppChannel implements ChannelAdapter {
         const raw: any = await res.json().catch(() => ({}));
         const err = raw?.error ?? res.statusText;
         this.logger?.error?.(`whatsapp: send HTTP ${res.status}: ${err}`);
+        return false;
       }
+      return true;
     } catch (e) {
       this.logger?.error?.(`whatsapp: send failed: ${e}`);
+      return false;
     }
   }
 

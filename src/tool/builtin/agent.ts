@@ -106,7 +106,7 @@ export type CreateAgentToolOptions = {
   temperature?: number;
 };
 
-const DEFAULT_MAX_OUTPUT_TOKENS = 4_096;
+const DEFAULT_MAX_OUTPUT_TOKENS = 65_536;
 const DEFAULT_PROVIDER_FALLBACK = "pilotdeck";
 const DEFAULT_MODEL_FALLBACK = "moonshotai/kimi-k2.6";
 const DEFAULT_SUBAGENT_TIMEOUT_MS = 60 * 60_000;
@@ -150,7 +150,7 @@ export function createAgentTool(
     },
     maxResultBytes: 200_000,
     isReadOnly: () => false,
-    isConcurrencySafe: () => false,
+    isConcurrencySafe: () => true,
     isOpenWorld: () => true,
     checkPermissions: async (): Promise<PermissionResult> => ({
       type: "allow",
@@ -169,7 +169,7 @@ export function createAgentTool(
       // Full fork path (C2): preferred when AgentLoop wired the fork API.
       if (context.subagent) {
         let requestedType = explicit ?? "general-purpose";
-        if (context.permissionContext?.mode === "plan" && requestedType === "general-purpose") {
+        if ((context.permissionContext?.mode === "plan" || context.runMode === "ask") && requestedType === "general-purpose") {
           requestedType = "explore";
         }
         return runFullFork({
@@ -181,7 +181,7 @@ export function createAgentTool(
         });
       }
       let requestedType = explicit ?? "general-purpose";
-      if (context.permissionContext?.mode === "plan" && requestedType === "general-purpose") {
+      if ((context.permissionContext?.mode === "plan" || context.runMode === "ask") && requestedType === "general-purpose") {
         requestedType = "explore";
       }
 
@@ -229,24 +229,19 @@ function buildAgentToolDescription(): string {
     "The subagent returns one structured report with these sections: `Scope`, `Result`, `Key files`, `Files changed`, and `Issues`.",
     "",
     "Runtime behavior:",
+    "- Multiple independent agent calls in one assistant message may run concurrently; batch sibling investigations when their scopes do not depend on each other.",
     "- Inside the AgentLoop, this runs a real forked subagent with its own scoped tool loop.",
     "- In stand-alone runtimes and some tests, it falls back to a single model call that preserves the same high-level subagent intent.",
   ].join("\n");
 }
 
-const PLAN_MODE_SUBAGENT_TYPES = ["explore", "plan"] as const;
+const ASK_MODE_SUBAGENT_TYPES = ["explore", "plan", "verify"] as const;
 
-/**
- * Returns replacement `description` and `inputSchema` for the `agent` tool
- * when the parent agent is in plan mode. The override removes
- * `general-purpose` from the advertised presets and changes the default to
- * `explore`, so the model is guided toward read-only subagent types only.
- */
-export function buildPlanModeAgentToolSchema(): {
+export function buildAskModeAgentToolSchema(): {
   description: string;
   inputSchema: Record<string, unknown>;
 } {
-  const typeLines = PLAN_MODE_SUBAGENT_TYPES
+  const typeLines = ASK_MODE_SUBAGENT_TYPES
     .map((id) => {
       const definition = SUBAGENT_DEFINITIONS[id];
       return `- ${id}: ${definition.description} Tools: ${definition.allowedTools.join(", ")}.`;
@@ -254,14 +249,14 @@ export function buildPlanModeAgentToolSchema(): {
     .join("\n");
 
   const description = [
-    "Launch a read-only subagent for investigation or planning.",
+    "Launch a read-only subagent for investigation, planning, or verification.",
     "",
-    "In plan mode, only read-only subagent types are available. The 'general-purpose' type is NOT available because it includes write tools that conflict with plan mode's read-only constraint.",
+    "In ask mode, subagents inherit ask mode and the same permission setting. Only read-only subagent types are available; 'general-purpose' is treated as 'explore'.",
     "",
     "Provide:",
     "- `description`: a short 3-5 word label for the task.",
-    "- `prompt`: the full directive for the subagent — include goal, context, and what good output looks like. The subagent can only read and search code, not modify files.",
-    "- `subagent_type` (optional): 'explore' (read-only with read_file/grep/glob/bash) or 'plan' (read-only with read_file/grep/glob). Defaults to 'explore'.",
+    "- `prompt`: the full directive for the subagent. Include goal, context, constraints, and what good output looks like. The subagent can only read and search; it cannot modify files.",
+    "- `subagent_type` (optional): 'explore', 'plan', or 'verify'. Defaults to 'explore'.",
     "",
     "Available subagent types:",
     typeLines,
@@ -281,12 +276,12 @@ export function buildPlanModeAgentToolSchema(): {
       prompt: {
         type: "string",
         description:
-          "Detailed directive for the subagent. Include the goal, relevant context, and what good output looks like. The subagent can only read and search code, not modify files or run write commands.",
+          "Detailed directive for the subagent. Include the goal, relevant context, constraints, and desired output. The subagent can only read and search; it cannot modify files.",
       },
       subagent_type: {
         type: "string",
         description:
-          "Subagent preset. In plan mode only 'explore' (read-only with read_file/grep/glob/bash) and 'plan' (read-only with read_file/grep/glob) are available. Defaults to 'explore'.",
+          "Subagent preset. In ask mode only 'explore', 'plan', and 'verify' are available. Defaults to 'explore'.",
       },
       subagentType: {
         type: "string",
@@ -299,10 +294,25 @@ export function buildPlanModeAgentToolSchema(): {
 }
 
 function normalizeRequestedSubagentType(value: string | undefined): string | undefined {
-  if (value === "general_purpose") {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const normalized = trimmed.toLowerCase();
+  if (
+    normalized === "general-purpose" ||
+    normalized === "general_purpose" ||
+    normalized === "general purpose"
+  ) {
     return "general-purpose";
   }
-  return value;
+  if (normalized === "explore" || normalized === "explorer") {
+    return "explore";
+  }
+  if (normalized === "plan" || normalized === "verify") {
+    return normalized;
+  }
+  return trimmed;
 }
 
 async function runFullFork(args: {
@@ -337,6 +347,7 @@ async function runFullFork(args: {
       definitionId: requestedType,
       directive,
       subagentId,
+      toolCallId: context.currentToolCallId,
       abortSignal: context.abortSignal,
       timeoutMs,
     });

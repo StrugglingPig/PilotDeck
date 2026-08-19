@@ -14,8 +14,12 @@ export const PILOTDECK_GATEWAY_PROTOCOL_VERSION_WEB = "1.0";
 export type WebGatewayMode =
   | "default"
   | "plan"
-  | "acceptEdits"
   | "bypassPermissions";
+
+export type WebAgentRunMode =
+  | "agent"
+  | "plan"
+  | "ask";
 
 export type WebGatewayChannelKey =
   | "cli"
@@ -36,10 +40,16 @@ export type WebElicitationAnswer =
   | { type: "answered"; answers: Record<string, string | string[]>; annotations?: Record<string, { preview?: string; notes?: string }> }
   | { type: "cancelled"; reason?: string };
 
-export type WebGatewayEvent =
+type WebGatewayEventMetadata = {
+  runId?: string;
+};
+
+export type WebGatewayEvent = WebGatewayEventMetadata & (
   | { type: "turn_started"; runId: string }
+  | { type: "model_selection_changed"; provider: string; model: string; source: "turn" | "session" | "router" | "default"; reasoning?: number; temperature?: number }
   | { type: "assistant_text_delta"; text: string }
   | { type: "assistant_thinking_delta"; text: string }
+  | { type: "file_artifacts"; artifacts: import("../../session/artifacts/FileArtifact.js").FileArtifact[] }
   | {
       type: "tool_call_started";
       toolCallId: string;
@@ -67,6 +77,7 @@ export type WebGatewayEvent =
         detail?: "auto" | "low" | "high";
       }>;
     }
+  | { type: "tool_result_detail_available"; toolCallId: string; resultPath?: string; fullText?: string }
   | {
       type: "permission_request";
       requestId: string;
@@ -88,8 +99,24 @@ export type WebGatewayEvent =
   | { type: "config_changed"; changedPaths: string[]; changeClasses: string[] }
   | { type: "worktree_created"; runId: string; cwd: string }
   | { type: "worktree_removed"; cwd: string }
+  | { type: "agent_status"; event: string; detail?: Record<string, unknown> }
   | { type: "turn_completed"; usage: Record<string, number>; finishReason: string }
-  | { type: "error"; message: string; code?: string; recoverable: boolean };
+  | {
+      type: "error";
+      message: string;
+      code?: string;
+      recoverable: boolean;
+      userHint?: string;
+      providerError?: {
+        provider?: string;
+        protocol?: string;
+        status?: number;
+        code?: string;
+        message?: string;
+        raw?: string;
+      };
+    }
+);
 
 export type WebGatewayMethod =
   | "submit_turn"
@@ -99,9 +126,16 @@ export type WebGatewayMethod =
   | "new_session"
   | "close_session"
   | "describe_server"
+  | "project_files_list"
+  | "commands_list"
+  | "model_catalog_list"
+  | "session_model_get"
+  | "session_model_set"
+  | "session_model_clear"
   | "active_turn_snapshot"
   | "cron_create"
   | "cron_list"
+  | "cron_update"
   | "cron_delete"
   | "cron_stop"
   | "cron_run_now"
@@ -109,6 +143,8 @@ export type WebGatewayMethod =
   | "permission_decide"
   | "grant_session_permission"
   | "read_session_messages"
+  | "read_subagent_messages"
+  | "fork_session"
   | "rename_session"
   | "delete_session"
   | "list_projects"
@@ -130,10 +166,33 @@ export type WebSubmitTurnInput = {
   channelKey: WebGatewayChannelKey;
   message: string;
   projectKey?: string;
+  uploadedAttachments?: Array<{ uploadId: string; attachmentIds?: string[] }>;
+  modelOverride?: WebExplicitModelSelection;
   attachments?: WebChannelAttachment[];
+  runMode?: WebAgentRunMode;
   mode?: WebGatewayMode;
+  basePermissionMode?: WebGatewayMode;
+  /** Allow model-visible plan mode tools. Defaults to true only for explicit plan-mode turns. */
+  allowPlanModeTools?: boolean;
+  canPrompt?: boolean;
   runId?: string;
 };
+
+export type WebMatchRange = { field: string; start: number; end: number };
+export type WebProjectFilesListInput = { projectKey: string; query?: string; cursor?: string; limit?: number; includeDirs?: boolean };
+export type WebProjectFilesListResult = {
+  projectKey: string;
+  items: Array<{ id: string; name: string; relativePath: string; kind: "file" | "directory"; size: number; mtimeMs: number; matches?: WebMatchRange[] }>;
+  nextCursor?: string;
+};
+export type WebCommandsListInput = { projectKey: string; query?: string; cursor?: string; limit?: number };
+export type WebCommandsListResult = { pinned: unknown[]; builtIn: unknown[]; custom: unknown[]; nextCursor?: string };
+export type WebExplicitModelSelection = { mode: "model"; provider: string; model: string; reasoning?: number; temperature?: number };
+export type WebSessionModelSelection = { mode: "auto" } | WebExplicitModelSelection;
+export type WebModelCatalogListInput = { projectKey: string; query?: string; provider?: string; includeAuto?: boolean };
+export type WebModelCatalogListResult = { items: unknown[]; router: { enabled: boolean; autoAvailable: boolean } };
+export type WebSessionModelInput = { projectKey: string; sessionKey: string };
+export type WebSessionModelResult = WebSessionModelInput & { saved?: WebSessionModelSelection; effective: { provider: string; model: string; source: "session" | "router" | "default"; reasoning?: number; temperature?: number } };
 
 export type WebChannelAttachment = {
   type: "file" | "image" | "text" | "unknown";
@@ -157,6 +216,10 @@ export type WebSessionInfo = {
   cwd?: string;
   tag?: string;
   createdAt?: number;
+  sessionKind?: "background_task";
+  parentSessionId?: string;
+  relativeTranscriptPath?: string;
+  forkedFromTurnId?: string;
 };
 
 export type WebListSessionsInput = {
@@ -179,6 +242,7 @@ export type WebHelloOk = {
     protocolVersion?: string;
     projectKey?: string;
     sessionCount?: number;
+    capabilities?: Array<"project_files_list" | "commands_list" | "model_catalog_list" | "session_model_get" | "session_model_set" | "session_model_clear">;
   };
 };
 
@@ -195,7 +259,7 @@ export type WebResponseFrame =
       type: "response";
       id: string;
       ok: false;
-      error: { code: string; message: string };
+      error: { code: string; message: string; details?: unknown };
     };
 
 export type WebEventFrame = {
@@ -226,6 +290,9 @@ export type WebSessionPermissionGrant = {
 export type WebReadSessionMessagesInput = {
   sessionKey: string;
   projectKey?: string;
+  sessionKind?: "background_task";
+  parentSessionId?: string;
+  relativeTranscriptPath?: string;
   limit?: number;
   cursor?: string;
   direction?: "forward" | "backward";
@@ -235,11 +302,43 @@ export type WebReadSessionMessagesResult = {
   messages: import("./webMessage.js").WebMessage[];
   nextCursor?: string;
   total?: number;
+  tokenUsage?: Record<string, unknown>;
   session: WebSessionInfo;
+};
+
+export type WebReadSubagentMessagesInput = {
+  sessionKey: string;
+  subagentId: string;
+  projectKey?: string;
+  sessionKind?: "background_task";
+  parentSessionId?: string;
+  relativeTranscriptPath?: string;
+};
+
+export type WebReadSubagentMessagesResult = {
+  messages: import("./webMessage.js").WebMessage[];
+  total: number;
+};
+
+export type WebForkSessionInput = {
+  sessionKey: string;
+  projectKey?: string;
+  /** Transcript entry id of the user turn to fork from (accepted_input entryId). */
+  fromEntryId: string;
+};
+
+export type WebForkSessionResult = {
+  newSessionKey: string;
+  prefillText: string;
+  carriedMessageCount: number;
+  runMode?: WebAgentRunMode;
+  mode?: WebGatewayMode;
 };
 
 export type WebActiveTurnSnapshotInput = {
   sessionKey: string;
+  /** Defaults to true. Set false for status-only polling. */
+  includeEvents?: boolean;
 };
 
 export type WebActiveTurnSnapshot = {

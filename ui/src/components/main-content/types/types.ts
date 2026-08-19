@@ -1,6 +1,10 @@
-import type { AppTab, Project, ProjectSession } from '../../../types/app';
+import type { AlwaysOnSubTab, AppTab, Project, ProjectSession } from '../../../types/app';
 
 export type SessionLifecycleHandler = (sessionId?: string | null) => void;
+
+export type SessionNavigationOptions = {
+  preserveActiveTab?: boolean;
+};
 
 export type TaskMasterTask = {
   id: string | number;
@@ -37,6 +41,8 @@ export type MainContentProps = {
   selectedSession: ProjectSession | null;
   activeTab: AppTab;
   setActiveTab: (tab: AppTab) => void;
+  alwaysOnSubTab?: AlwaysOnSubTab;
+  onAlwaysOnSubTabChange?: (tab: AlwaysOnSubTab) => void;
   ws: WebSocket | null;
   sendMessage: (message: unknown) => void;
   latestMessage: unknown;
@@ -55,16 +61,25 @@ export type MainContentProps = {
     optimisticTitle?: string,
   ) => void;
   processingSessions: Set<string>;
+  unreadSessionIds: Set<string>;
   onReplaceTemporarySession: SessionLifecycleHandler;
   onNavigateToSession: (targetSessionId: string) => void;
-  onStartNewSession: (project: Project) => void;
+  onStartNewSession: (project: Project, options?: SessionNavigationOptions) => void;
   // Used by session lists to jump to the Agent tab and select
   // (project, sessionId). Optional because legacy MainContent
   // consumers don't need it.
-  onSelectSession?: (project: Project, sessionId: string, fallbackSession?: ProjectSession) => void;
+  onSelectSession?: (
+    project: Project,
+    sessionId: string,
+    fallbackSession?: ProjectSession,
+    options?: SessionNavigationOptions,
+  ) => void;
   onShowSettings: () => void;
   onSelectProjectByName?: (projectName: string) => void;
   externalMessageUpdate: number;
+  /** When the URL uses /session/<file> by mistake, open the file in the editor. */
+  misroutedFileFromUrl?: string | null;
+  onMisroutedFileUrlHandled?: () => void;
 };
 
 export type MainContentStateViewProps = {

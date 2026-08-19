@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { createAlwaysOnManager, createApplyHandler, SessionConfigOverrides, type AlwaysOnManager, type AlwaysOnConfig } from "../always-on/index.js";
-import { createCronRuntime, type CronRuntime, type CronConfig } from "../cron/index.js";
+import { createCronManager, type CronManager, type CronConfig } from "../cron/index.js";
 import { connectRemoteGatewayIfAvailable, type Gateway, type GatewayEvent, type GatewaySubmitTurnInput } from "../gateway/index.js";
-import { CliChannel, TuiChannel, FeishuChannel, WeixinChannel, QQChannel, loadEnabledChannels } from "../adapters/index.js";
+import {
+  CliChannel, TuiChannel, FeishuChannel, WeixinChannel, QQChannel, WeComChannel,
+  loadEnabledChannels, ChannelStatePersistence,
+  FeishuSessionMapper, WeixinSessionMapper, QQSessionMapper, WeComSessionMapper,
+  type FeishuSessionMapperState, type WeixinSessionMapperState, type QQSessionMapperState, type WeComSessionMapperState,
+} from "../adapters/index.js";
 import {
   migrateSkillsToPilotDeck,
   type SkillMigrationConflictMode,
@@ -13,9 +18,11 @@ import {
 import { loadPilotConfig, resolvePilotHome } from "../pilot/index.js";
 import { createLocalGateway } from "./createLocalGateway.js";
 import { startPilotDeckServer } from "./pilotdeckServer.js";
-import { installGlobalProxy } from "./proxy.js";
+import { installGlobalProxy, reinstallGlobalProxy } from "./proxy.js";
+import { createShutdownAndExit } from "./shutdownCoordinator.js";
+import { createTelemetryCollector } from "../telemetry/index.js";
 
-installGlobalProxy();
+await installGlobalProxy();
 
 async function main(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0];
@@ -24,10 +31,21 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     const env = process.env;
     const pilotHome = resolvePilotHome(env);
     const snapshot = loadPilotConfig({ projectRoot, env });
+    const telemetry = createTelemetryCollector({
+      env, pilotHome,
+      enabled: snapshot.config.telemetry?.enabled,
+    });
+
+    // Apply proxy from config (env-based proxy from top-level installGlobalProxy
+    // takes precedence; this fills in when only pilotdeck.yaml has a proxy).
+    if (snapshot.config.proxy?.url) {
+      await installGlobalProxy(snapshot.config.proxy.url);
+    }
 
     let alwaysOn: AlwaysOnManager | undefined;
-    let cron: CronRuntime | undefined;
+    let cron: CronManager | undefined;
     let deferredBroadcast: ((name: string, payload?: unknown) => void) | undefined;
+    const sessionOverrides = new SessionConfigOverrides();
 
     const alwaysOnLogger = {
       info: (message: string, data?: Record<string, unknown>) =>
@@ -47,7 +65,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       return createAlwaysOnManager({
         config,
         pilotHome,
+        sessionOverrides,
         logger: alwaysOnLogger,
+        telemetry,
         onWorktreeCreated: (runId, cwd) => {
           deferredBroadcast?.("worktree_created", { runId, cwd });
         },
@@ -60,13 +80,28 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       });
     }
 
-    function buildCron(config: CronConfig | undefined): CronRuntime | undefined {
+    function buildCron(config: CronConfig | undefined): CronManager | undefined {
       if (!config) return undefined;
-      return createCronRuntime({
+      return createCronManager({
         config,
         pilotHome,
-        projectKey: projectRoot,
+        sessionOverrides,
         logger: cronLogger,
+        telemetry,
+        onTurnEvent: (sessionKey, channelKey, event) => {
+          deferredBroadcast?.("always-on:turn-event", { sessionKey, channelKey, event });
+        },
+        onResultDelivery: (delivery) => {
+          void serverRef?.deliverCronResult(delivery)
+            .then((delivered) => {
+              if (!delivered) {
+                console.warn(`[cron] result delivery was not handled task=${delivery.taskId} run=${delivery.runId}`);
+              }
+            })
+            .catch((error: unknown) => {
+              console.warn(`[cron] result delivery failed ${error instanceof Error ? error.message : String(error)}`);
+            });
+        },
       });
     }
 
@@ -80,17 +115,19 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       projectRoot,
       pilotHome,
       env,
-      skipDefaultProject: !!env.PILOTDECK_SKIP_DEFAULT_PROJECT,
+      fallbackProjectRoot: pilotHome,
       extraTools: [...(alwaysOn?.getTools() ?? []), ...(cron?.getTools() ?? [])],
-      sessionOverrides: alwaysOn?.getSessionOverrides(),
+      sessionOverrides,
       cron,
+      telemetry,
     });
 
     const standaloneApply = createApplyHandler({
       gateway,
       pilotHome,
-      sessionOverrides: alwaysOn?.getSessionOverrides() ?? new SessionConfigOverrides(),
+      sessionOverrides,
       alwaysOnConfig: snapshot.config.alwaysOn,
+      telemetry,
       onTurnEvent: (sessionKey, channelKey, event) => {
         deferredBroadcast?.("always-on:turn-event", { sessionKey, channelKey, event });
       },
@@ -102,7 +139,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     updateSubsystems({
       extraTools: [...(alwaysOn?.getTools() ?? []), ...(cron?.getTools() ?? [])],
-      sessionOverrides: alwaysOn?.getSessionOverrides(),
+      sessionOverrides,
       cron,
       alwaysOnApply: alwaysOn
         ? (input) => alwaysOn!.applyCycle(input)
@@ -121,8 +158,30 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     let reloadChain = Promise.resolve();
 
     configStore.subscribe((event) => {
-      const aoChanged = event.changedPaths.some((p) => p.startsWith("alwaysOn."));
-      const cronChanged = event.changedPaths.some((p) => p.startsWith("cron."));
+      if (event.changedPaths.some((p) => p.startsWith("telemetry.") || p === "telemetry")) {
+        telemetry.setEnabled(event.nextSnapshot.config.telemetry?.enabled ?? false);
+      }
+
+      const aoChanged = event.changedPaths.some((p) => p.startsWith("alwaysOn.") || p === "alwaysOn");
+      const cronChanged = event.changedPaths.some((p) => p.startsWith("cron.") || p === "cron");
+      const proxyChanged = event.changedPaths.some((p) => p.startsWith("proxy.") || p === "proxy");
+      const adapterChanged = event.changedPaths.some((p) => p.startsWith("adapters."));
+
+      if (proxyChanged) {
+        const proxyConfig = event.nextSnapshot.config.proxy;
+        void reinstallGlobalProxy(proxyConfig?.url, proxyConfig?.noProxy);
+      }
+
+      if (adapterChanged) {
+        reloadChain = reloadChain
+          .then(() => handleAdapterHotReload(event.nextSnapshot.config))
+          .catch((err) =>
+            console.warn(
+              `[pilotdeck] adapter hot-reload failed: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
+      }
+
       if (!aoChanged && !cronChanged) return;
 
       reloadChain = reloadChain
@@ -159,8 +218,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       const fallbackApply = createApplyHandler({
         gateway,
         pilotHome,
-        sessionOverrides: alwaysOn?.getSessionOverrides() ?? new SessionConfigOverrides(),
+        sessionOverrides,
         alwaysOnConfig: config.alwaysOn,
+        telemetry,
         onTurnEvent: (sessionKey, channelKey, event) => {
           deferredBroadcast?.("always-on:turn-event", { sessionKey, channelKey, event });
         },
@@ -168,7 +228,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 
       updateSubsystems({
         extraTools: [...(alwaysOn?.getTools() ?? []), ...(cron?.getTools() ?? [])],
-        sessionOverrides: alwaysOn?.getSessionOverrides(),
+        sessionOverrides,
         cron,
         alwaysOnApply: alwaysOn ? (input) => alwaysOn!.applyCycle(input) : fallbackApply,
         alwaysOnRerunPlan: alwaysOn ? (input) => alwaysOn!.rerunPlan(input) : undefined,
@@ -184,11 +244,96 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       console.log(`[pilotdeck] Subsystem hot-reload complete: ${parts.join(", ")}`);
     }
 
+    // --- Channel state persistence ---
+
+    const channelStatePersistence = new ChannelStatePersistence({
+      stateDir: resolve(pilotHome, "channels"),
+    });
+
+    // --- Adapter hot-reload ---
+
+    let serverRef: Awaited<ReturnType<typeof startPilotDeckServer>> | undefined;
+
+    async function hotStartWeixinChannel(): Promise<void> {
+      if (!serverRef) return;
+      const savedWeixin = await channelStatePersistence.load<WeixinSessionMapperState>("weixin");
+      await serverRef.hotStartChannel(new WeixinChannel({
+        mapper: savedWeixin ? new WeixinSessionMapper(savedWeixin) : undefined,
+        onStateChange: (state) => channelStatePersistence.save("weixin", state),
+      }));
+    }
+
+    async function handleAdapterHotReload(config: (typeof snapshot)["config"]): Promise<void> {
+      if (!serverRef) return;
+      const parts: string[] = [];
+
+      const fCfg = config.adapters?.feishu;
+      if (fCfg?.enabled === true) {
+        const savedFeishu = await channelStatePersistence.load<FeishuSessionMapperState>("feishu");
+        const ch = new FeishuChannel({
+          appId: fCfg.appId,
+          appSecret: fCfg.appSecret,
+          encryptKey: fCfg.encryptKey,
+          verifyToken: fCfg.verifyToken,
+          connectionMode: fCfg.connectionMode,
+          domainName: fCfg.domainName,
+          mapper: savedFeishu ? new FeishuSessionMapper(savedFeishu) : undefined,
+          onStateChange: (state) => channelStatePersistence.save("feishu", state),
+        });
+        await serverRef.hotStartChannel(ch);
+        parts.push("feishu=started");
+      }
+
+      const wCfg = config.adapters?.weixin;
+      if (wCfg?.enabled === true) {
+        await hotStartWeixinChannel();
+        parts.push("weixin=started");
+      }
+
+      const qqCfg = config.adapters?.qq;
+      if (qqCfg?.enabled === true) {
+        const savedQQ = await channelStatePersistence.load<QQSessionMapperState>("qq");
+        await serverRef.hotStartChannel(new QQChannel({
+          appId: qqCfg.appId,
+          clientSecret: qqCfg.clientSecret,
+          allowGroups: qqCfg.allowGroups,
+          triggerPrefixes: qqCfg.triggerPrefixes,
+          maxMessageLength: qqCfg.maxMessageLength,
+          mapper: savedQQ ? new QQSessionMapper(savedQQ) : undefined,
+          onStateChange: (state) => channelStatePersistence.save("qq", state),
+        }));
+        parts.push("qq=started");
+      }
+
+      const wcCfg = config.adapters?.wecom;
+      if (wcCfg?.enabled === true) {
+        const savedWeCom = await channelStatePersistence.load<WeComSessionMapperState>("wecom");
+        await serverRef.hotStartChannel(new WeComChannel({
+          botKey: wcCfg.token,
+          extra: wcCfg.extra,
+          mapper: savedWeCom ? new WeComSessionMapper(savedWeCom) : undefined,
+          onStateChange: (state) => channelStatePersistence.save("wecom", state),
+        }));
+        parts.push("wecom=started");
+      }
+
+      const extraChannels = await loadEnabledChannels(config.adapters);
+      for (const ch of extraChannels) {
+        await serverRef.hotStartChannel(ch);
+        parts.push(`${ch.channelKey}=started`);
+      }
+
+      if (parts.length) {
+        console.log(`[pilotdeck] Adapter hot-reload complete: ${parts.join(", ")}`);
+      }
+    }
+
     // --- Server startup ---
 
     const envPort = Number.parseInt(env.PILOTDECK_GATEWAY_PORT ?? "", 10);
     const extraChannels = await loadEnabledChannels(snapshot.config.adapters);
     const feishuCfg = snapshot.config.adapters?.feishu;
+    const savedFeishuState = await channelStatePersistence.load<FeishuSessionMapperState>("feishu");
     const feishuChannel = feishuCfg?.enabled === true
       ? new FeishuChannel({
           appId: feishuCfg.appId,
@@ -197,19 +342,66 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
           verifyToken: feishuCfg.verifyToken,
           connectionMode: feishuCfg.connectionMode,
           domainName: feishuCfg.domainName,
+          mapper: savedFeishuState ? new FeishuSessionMapper(savedFeishuState) : undefined,
+          onStateChange: (state) => channelStatePersistence.save("feishu", state),
         })
       : undefined;
     const weixinCfg = snapshot.config.adapters?.weixin;
-    const weixinChannel = weixinCfg?.enabled === true ? new WeixinChannel() : undefined;
+    const savedWeixinState = await channelStatePersistence.load<WeixinSessionMapperState>("weixin");
+    const weixinChannel = weixinCfg?.enabled === true
+      ? new WeixinChannel({
+          mapper: savedWeixinState ? new WeixinSessionMapper(savedWeixinState) : undefined,
+          onStateChange: (state) => channelStatePersistence.save("weixin", state),
+        })
+      : undefined;
+    const qqCfg = snapshot.config.adapters?.qq;
+    const savedQQState = await channelStatePersistence.load<QQSessionMapperState>("qq");
+    const qqChannel = qqCfg?.enabled === true
+      ? new QQChannel({
+          appId: qqCfg.appId,
+          clientSecret: qqCfg.clientSecret,
+          allowGroups: qqCfg.allowGroups,
+          triggerPrefixes: qqCfg.triggerPrefixes,
+          maxMessageLength: qqCfg.maxMessageLength,
+          mapper: savedQQState ? new QQSessionMapper(savedQQState) : undefined,
+          onStateChange: (state) => channelStatePersistence.save("qq", state),
+        })
+      : undefined;
+    const wecomCfg = snapshot.config.adapters?.wecom;
+    const savedWeComState = await channelStatePersistence.load<WeComSessionMapperState>("wecom");
+    const wecomChannel = wecomCfg?.enabled === true
+      ? new WeComChannel({
+          botKey: wecomCfg.token,
+          extra: wecomCfg.extra,
+          mapper: savedWeComState ? new WeComSessionMapper(savedWeComState) : undefined,
+          onStateChange: (state) => channelStatePersistence.save("wecom", state),
+        })
+      : undefined;
+    const allChannels = [...extraChannels, ...(wecomChannel ? [wecomChannel] : [])];
     const server = await startPilotDeckServer({
       gateway,
       port: readPort(argv) ?? (Number.isFinite(envPort) ? envPort : 18789),
       staticAssetsPath: resolve(projectRoot, "ui/dist"),
       feishu: feishuChannel,
       weixin: weixinChannel,
-      qq: new QQChannel(),
-      channels: extraChannels,
+      qq: qqChannel,
+      channels: allChannels,
       config: snapshot.config,
+    });
+    serverRef = server;
+    (
+      gateway as {
+        setPrepareWeixinLogin?: (
+          handler: () => Promise<{ requested: boolean; requestedAt: string; reason?: "unsupported" }>
+        ) => void;
+      }
+    ).setPrepareWeixinLogin?.(async () => {
+      const requestedAt = new Date().toISOString();
+      if (!serverRef) {
+        return { requested: false, requestedAt, reason: "unsupported" };
+      }
+      await hotStartWeixinChannel();
+      return { requested: true, requestedAt };
     });
     bindServer(server);
     deferredBroadcast = (name, payload) => server.broadcastNotification(name, payload);
@@ -220,20 +412,44 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     const stop = async () => {
       try {
+        await channelStatePersistence.flush();
+        console.log(`[telemetry] shutdown snapshot ${JSON.stringify(telemetry.snapshot())}`);
         disposeGateway();
         await alwaysOn?.stop();
         await cron?.stop();
+        await telemetry.shutdown();
       } catch (error) {
         console.warn(`[runtime] stop failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
+    const shutdownAndExit = createShutdownAndExit(stop, (exitCode) => process.exit(exitCode));
+    process.on("uncaughtException", (error) => {
+      telemetry.trackError(error, { module: "runtime", metadata: { source: "uncaughtException" } });
+      void shutdownAndExit(1);
+    });
+    process.on("unhandledRejection", (reason) => {
+      telemetry.trackError(reason, { module: "runtime", metadata: { source: "unhandledRejection" } });
+      void shutdownAndExit(1);
+    });
     process.on("SIGINT", () => {
-      void stop().finally(() => process.exit(0));
+      void shutdownAndExit(0);
     });
     process.on("SIGTERM", () => {
-      void stop().finally(() => process.exit(0));
+      void shutdownAndExit(0);
     });
     await new Promise(() => undefined);
+    return;
+  }
+
+  if (command === "gateway") {
+    const sub = argv[1];
+    if (sub === "setup") {
+      const { runGatewaySetup } = await import("./commands/gatewaySetup.js");
+      await runGatewaySetup(argv.slice(2));
+      return;
+    }
+    console.error("Usage: pilotdeck gateway setup [feishu|weixin|wecom]");
+    process.exitCode = 1;
     return;
   }
 
@@ -242,8 +458,19 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
 
+  if (command === "update") {
+    await handleUpdateCommand(argv.slice(1));
+    return;
+  }
+
   if (command === "skills") {
     await handleSkillsCommand(argv.slice(1));
+    return;
+  }
+
+  if (command === "chat") {
+    const { runChatSearchCli } = await import("./commands/chatSearch.js");
+    await runChatSearchCli(argv.slice(1));
     return;
   }
 
@@ -278,6 +505,64 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 
   const { gateway: fallbackGateway } = createLocalGateway({ projectRoot: process.cwd() });
   await new CliChannel({ argv, projectKey: process.cwd() }).start({ gateway: fallbackGateway });
+}
+
+async function handleUpdateCommand(argv: string[]): Promise<void> {
+  const { execFileSync } = await import("node:child_process");
+  const { resolve: resolvePath, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+
+  const __filename = fileURLToPath(import.meta.url);
+  const projectRoot = resolvePath(dirname(__filename), "..", "..", "..");
+  const scriptPath = resolvePath(projectRoot, "scripts", "update.sh");
+
+  const doRestart = argv.includes("--restart");
+  const checkOnly = argv.includes("--check");
+
+  if (checkOnly) {
+    try {
+      const branch = execFileSync("git", ["branch", "--show-current"], { cwd: projectRoot, encoding: "utf-8" }).trim() || "main";
+      execFileSync("git", ["fetch", "origin", branch], { cwd: projectRoot, encoding: "utf-8", stdio: "pipe" });
+      const local = execFileSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf-8" }).trim();
+      const remote = execFileSync("git", ["rev-parse", `origin/${branch}`], { cwd: projectRoot, encoding: "utf-8" }).trim();
+
+      if (local === remote) {
+        console.log(`Already up-to-date (${local.slice(0, 8)}) on branch ${branch}`);
+      } else {
+        const countStr = execFileSync("git", ["rev-list", "--count", `HEAD..origin/${branch}`], { cwd: projectRoot, encoding: "utf-8" }).trim();
+        console.log(`Update available: ${countStr} new commit(s) on branch ${branch}`);
+        console.log(`  local:  ${local.slice(0, 8)}`);
+        console.log(`  remote: ${remote.slice(0, 8)}`);
+        const log = execFileSync("git", ["log", "--oneline", `HEAD..origin/${branch}`, "-5"], { cwd: projectRoot, encoding: "utf-8" }).trim();
+        if (log) {
+          console.log("\nRecent commits:");
+          console.log(log);
+        }
+      }
+    } catch (e: unknown) {
+      console.error(`Failed to check for updates: ${e instanceof Error ? e.message : String(e)}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  const args = doRestart ? [scriptPath, "--restart"] : [scriptPath];
+
+  try {
+    execFileSync("bash", args, {
+      cwd: projectRoot,
+      stdio: "inherit",
+      env: { ...process.env, FORCE_COLOR: "1" },
+    });
+  } catch (e: unknown) {
+    const err = e as { status?: number };
+    if (err.status === 2) {
+      // Already up-to-date — not an error
+      return;
+    }
+    console.error(`Update failed with exit code ${err.status ?? "unknown"}`);
+    process.exitCode = 1;
+  }
 }
 
 async function handleCronCommand(argv: string[]): Promise<void> {
@@ -501,6 +786,9 @@ function createFallbackGateway(): Gateway {
     cronList: async () => {
       throw new Error("Cron runtime is not configured.");
     },
+    cronUpdate: async () => {
+      throw new Error("Cron runtime is not configured.");
+    },
     cronDelete: async () => {
       throw new Error("Cron runtime is not configured.");
     },
@@ -515,6 +803,12 @@ function createFallbackGateway(): Gateway {
     grantSessionPermission: async () => ({ granted: false }),
     readSessionMessages: async () => {
       throw new Error("read_session_messages is not configured.");
+    },
+    readSubagentMessages: async () => {
+      throw new Error("read_subagent_messages is not configured.");
+    },
+    forkSession: async () => {
+      throw new Error("fork_session is not configured.");
     },
     listProjects: async () => ({ projects: [] }),
     describeProject: async (input) => ({

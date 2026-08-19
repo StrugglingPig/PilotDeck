@@ -11,7 +11,10 @@ export type PilotDeckToolErrorCode =
   | "path_not_allowed"
   | "file_not_found"
   | "file_conflict"
-  | "unsupported_tool";
+  | "unsupported_tool"
+  | "setup_required"
+  | "plan_mode_violation"
+  | "ask_mode_violation";
 
 export type PilotDeckToolError = {
   code: PilotDeckToolErrorCode;

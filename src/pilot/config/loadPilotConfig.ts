@@ -19,10 +19,12 @@ import {
   type PilotAgentModelSelection,
   type PilotConfigDiagnostic,
   type PilotExtensionConfig,
+  type PilotProxyConfig,
   type PilotConfigLoadOptions,
   type PilotConfigSnapshot,
   type PilotConfigSource,
   type PilotRawConfig,
+  type PilotTelemetryConfig,
 } from "./types.js";
 
 const SUPPORTED_SCHEMA_VERSION = 1;
@@ -122,6 +124,8 @@ export function loadPilotConfig(options: PilotConfigLoadOptions = {}): PilotConf
   const alwaysOn = parseAlwaysOnConfig(rawConfig.alwaysOn, diagnostics);
   const cron = parseCronConfig(rawConfig.cron, diagnostics);
   const tools = parseToolsConfig(rawConfig.tools, diagnostics);
+  const telemetry = parseTelemetryConfig(rawConfig.telemetry);
+  const proxy = parseProxyConfig(rawConfig, diagnostics);
   throwConfigErrorIfFatal(diagnostics);
 
   const redactedSnapshotConfig = redactConfig({
@@ -135,6 +139,8 @@ export function loadPilotConfig(options: PilotConfigLoadOptions = {}): PilotConf
     alwaysOn,
     cron,
     tools,
+    telemetry,
+    proxy,
   });
   return deepFreeze({
     version: options.version ?? 1,
@@ -154,6 +160,8 @@ export function loadPilotConfig(options: PilotConfigLoadOptions = {}): PilotConf
       ...(alwaysOn ? { alwaysOn } : {}),
       ...(cron ? { cron } : {}),
       ...(tools ? { tools } : {}),
+      telemetry,
+      ...(proxy ? { proxy } : {}),
     },
   });
 }
@@ -299,11 +307,13 @@ function validateTopLevel(rawConfig: PilotRawConfig, diagnostics: PilotConfigDia
     "alwaysOn",
     "cron",
     "tools",
+    "proxy",
     // Reserved namespace for ui/server (Web UI Express bridge). The PilotDeck
     // gateway does not parse `webui.*` itself but tolerates it so a single
     // ~/.pilotdeck/pilotdeck.yaml can carry both gateway-side and ui-side
     // config without producing diagnostic noise.
     "webui",
+    "telemetry",
   ]);
   for (const key of Object.keys(rawConfig)) {
     if (!allowedKeys.has(key)) {
@@ -336,8 +346,10 @@ function parseAgent(
   }
 
   const model = parseAgentModelSelection(rawAgent.model, "agent.model", modelConfig, diagnostics);
-  const subagents = parseAgentSubagents(rawAgent.subagents, diagnostics);
+  const subagents = parseAgentSubagents(rawAgent.subagents, modelConfig, diagnostics);
   const maxContextTokens = readOptionalPositiveInteger(rawAgent.maxContextTokens, "agent.maxContextTokens");
+  const maxOutputTokens = readOptionalPositiveInteger(rawAgent.maxOutputTokens, "agent.maxOutputTokens");
+  const thinking = parseAgentThinking(rawAgent.thinking);
   if (rawAgent.fallbackModel !== undefined) {
     diagnostics.push({
       code: "CONFIG_AGENT_FALLBACK_MODEL_DEPRECATED",
@@ -353,12 +365,25 @@ function parseAgent(
   return {
     model,
     ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+    ...(thinking ? { thinking } : {}),
     ...(subagents ? { subagents } : {}),
+  };
+}
+
+function parseAgentThinking(value: unknown): PilotAgentConfig["thinking"] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isRecord(value)) return undefined;
+  if (value.enabled !== true) return undefined;
+  return {
+    enabled: true,
+    ...(typeof value.budgetTokens === "number" ? { budgetTokens: value.budgetTokens } : {}),
   };
 }
 
 function parseAgentSubagents(
   value: unknown,
+  modelConfig: ReturnType<typeof parseModel>,
   diagnostics: PilotConfigDiagnostic[],
 ): PilotAgentConfig["subagents"] | undefined {
   if (value === undefined) {
@@ -368,7 +393,18 @@ function parseAgentSubagents(
     throw new PilotConfigError("CONFIG_AGENT_SUBAGENTS_INVALID", "agent.subagents must be an object.");
   }
   for (const key of Object.keys(value)) {
-    if (key !== "timeoutMs") {
+    if (
+      key === "params" &&
+      !(isRecord(value.params) && Object.keys(value.params).length === 0)
+    ) {
+      diagnostics.push({
+        code: "CONFIG_AGENT_SUBAGENTS_PARAMS_UNSUPPORTED",
+        severity: "warning",
+        message: "agent.subagents.params is not supported and will be ignored.",
+        path: "agent.subagents.params",
+        recoverable: true,
+      });
+    } else if (key !== "timeoutMs" && key !== "default" && key !== "params") {
       diagnostics.push({
         code: "CONFIG_AGENT_UNKNOWN_FIELD",
         severity: "warning",
@@ -378,8 +414,83 @@ function parseAgentSubagents(
       });
     }
   }
+  let defaultModel: PilotAgentModelSelection | undefined;
+  if (value.default !== undefined && value.default !== null) {
+    if (typeof value.default === "string" && value.default.trim() === "inherit") {
+      defaultModel = undefined;
+    } else {
+      defaultModel = parseSubagentDefaultModelSelection(
+        value.default,
+        modelConfig,
+        diagnostics,
+      );
+    }
+  }
   return {
+    ...(defaultModel ? { default: defaultModel } : {}),
     timeoutMs: readOptionalPositiveInteger(value.timeoutMs, "agent.subagents.timeoutMs"),
+  };
+}
+
+function parseSubagentDefaultModelSelection(
+  value: unknown,
+  modelConfig: ReturnType<typeof parseModel>,
+  diagnostics: PilotConfigDiagnostic[],
+): PilotAgentModelSelection | undefined {
+  const path = "agent.subagents.default";
+  if (typeof value !== "string" || value.trim().length === 0) {
+    diagnostics.push({
+      code: "CONFIG_AGENT_SUBAGENT_MODEL_INVALID",
+      severity: "warning",
+      message: `${path} must be inherit or a provider/model string. Inheriting agent.model instead.`,
+      path,
+      recoverable: true,
+    });
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  const separatorIndex = trimmed.indexOf("/");
+  const providerId = separatorIndex >= 0 ? trimmed.slice(0, separatorIndex) : "";
+  const modelId = separatorIndex >= 0 ? trimmed.slice(separatorIndex + 1) : "";
+  if (!providerId || !modelId) {
+    diagnostics.push({
+      code: "CONFIG_AGENT_SUBAGENT_MODEL_INVALID",
+      severity: "warning",
+      message: `${path} must use provider/model format. Inheriting agent.model instead.`,
+      path,
+      recoverable: true,
+    });
+    return undefined;
+  }
+
+  const provider = modelConfig.providers[providerId];
+  if (!provider) {
+    diagnostics.push({
+      code: "CONFIG_AGENT_SUBAGENT_PROVIDER_NOT_FOUND",
+      severity: "warning",
+      message: `${path} references unknown provider ${providerId}. Inheriting agent.model instead.`,
+      path,
+      recoverable: true,
+    });
+    return undefined;
+  }
+
+  if (!provider.models[modelId]) {
+    diagnostics.push({
+      code: "CONFIG_AGENT_SUBAGENT_MODEL_NOT_FOUND",
+      severity: "warning",
+      message: `${path} references unknown model ${modelId} for provider ${providerId}. Inheriting agent.model instead.`,
+      path,
+      recoverable: true,
+    });
+    return undefined;
+  }
+
+  return {
+    id: trimmed,
+    provider: providerId,
+    model: modelId,
   };
 }
 
@@ -611,6 +722,70 @@ function parseRouterSection(
     });
   }
   return result.config;
+}
+
+function parseTelemetryConfig(raw: unknown): PilotTelemetryConfig {
+  return {
+    enabled: isRecord(raw) && (raw as Record<string, unknown>).enabled === true,
+  };
+}
+
+function parseProxyConfig(
+  rawConfig: PilotRawConfig,
+  diagnostics: PilotConfigDiagnostic[],
+): PilotProxyConfig | undefined {
+  let raw = rawConfig.proxy;
+
+  // Backward-compat: migrate webui.runtime.httpsProxy → proxy.url
+  if (raw === undefined && isRecord(rawConfig.webui)) {
+    const webui = rawConfig.webui as Record<string, unknown>;
+    if (isRecord(webui.runtime)) {
+      const runtime = webui.runtime as Record<string, unknown>;
+      if (typeof runtime.httpsProxy === "string" && runtime.httpsProxy) {
+        raw = { url: runtime.httpsProxy };
+        diagnostics.push({
+          code: "CONFIG_PROXY_MIGRATED",
+          severity: "info",
+          message:
+            "webui.runtime.httpsProxy has been migrated to the top-level proxy.url field. " +
+            "Please update your pilotdeck.yaml to use proxy.url instead.",
+          path: "webui.runtime.httpsProxy",
+          recoverable: true,
+        });
+      }
+    }
+  }
+
+  if (raw === undefined) return undefined;
+
+  if (typeof raw === "string") {
+    return { url: raw };
+  }
+
+  if (!isRecord(raw)) {
+    diagnostics.push({
+      code: "CONFIG_PROXY_INVALID",
+      severity: "warning",
+      message: "proxy must be a string or an object with a url field.",
+      path: "proxy",
+      recoverable: true,
+    });
+    return undefined;
+  }
+
+  if (typeof raw.url !== "string" || !raw.url) {
+    diagnostics.push({
+      code: "CONFIG_PROXY_URL_MISSING",
+      severity: "warning",
+      message: "proxy.url must be a non-empty string.",
+      path: "proxy.url",
+      recoverable: true,
+    });
+    return undefined;
+  }
+
+  const noProxy = typeof raw.noProxy === "string" ? raw.noProxy : undefined;
+  return { url: raw.url, ...(noProxy ? { noProxy } : {}) };
 }
 
 function deepFreeze<T>(value: T): T {

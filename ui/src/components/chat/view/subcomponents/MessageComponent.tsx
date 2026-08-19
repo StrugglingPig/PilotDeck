@@ -1,18 +1,29 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { FileText } from 'lucide-react';
+import { FileText, Search, Settings } from 'lucide-react';
 import SessionProviderLogo from '../../../llm-logo-provider/SessionProviderLogo';
 import type {
+  ChatAttachment,
   ChatMessage,
   PilotDeckPermissionSuggestion,
-  PermissionGrantResult,
   Provider,
+  SessionPermissionGrantResult,
 } from '../../types/types';
+import {
+  DOCUMENT_SELECTION_ATTACHMENT_KIND,
+  type DocumentSelectionReference,
+} from '../../../../types/documentSelection';
+import {
+  CONTENT_REFERENCE_ATTACHMENT_KIND,
+  normalizeContentReference,
+  type ContentReference,
+} from '../../../../types/contentReference';
 import { formatUsageLimitText } from '../../utils/chatFormatting';
 import { getPilotDeckPermissionSuggestion } from '../../utils/chatPermissions';
 import type { Project } from '../../../../types/app';
 import { ToolRenderer, shouldHideToolResult } from '../../tools';
 import { CollapsibleDisplay } from '../../tools/components';
+import DocumentReferenceChip from '../../../chat-v2/DocumentReferenceChip';
 import { Markdown } from './Markdown';
 import MessageCopyControl from './MessageCopyControl';
 import ImageLightbox, { type LightboxImage } from './ImageLightbox';
@@ -29,10 +40,12 @@ type MessageComponentProps = {
   createDiff: (oldStr: string, newStr: string) => DiffLine[];
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   onShowSettings?: () => void;
-  onGrantSessionToolPermission?: (suggestion: PilotDeckPermissionSuggestion) => PermissionGrantResult | null | undefined;
+  onGrantSessionToolPermission?: (suggestion: PilotDeckPermissionSuggestion) => SessionPermissionGrantResult | null | undefined;
   autoExpandTools?: boolean;
   showRawParameters?: boolean;
   showThinking?: boolean;
+  isToolSectionExpanded?: (sectionKey: string, defaultExpanded?: boolean) => boolean;
+  onToolSectionExpandedChange?: (sectionKey: string, expanded: boolean) => void;
   selectedProject?: Project | null;
   provider: Provider | string;
   hideHeader?: boolean;
@@ -46,6 +59,11 @@ type InteractiveOption = {
 
 type PermissionGrantState = 'idle' | 'granted' | 'error';
 
+type I18nDescriptor = {
+  key?: unknown;
+  params?: unknown;
+};
+
 const stringifyMessageContent = (content: unknown): string => {
   if (typeof content === 'string') return content;
   if (content === undefined || content === null) return '';
@@ -55,6 +73,20 @@ const stringifyMessageContent = (content: unknown): string => {
     return String(content);
   }
 };
+
+function translateDescriptor(
+  t: ReturnType<typeof useTranslation>['t'],
+  descriptor: unknown,
+  fallback: string,
+): string {
+  if (!descriptor || typeof descriptor !== 'object') return fallback;
+  const { key, params } = descriptor as I18nDescriptor;
+  if (typeof key !== 'string' || !key.trim()) return fallback;
+  const interpolation = params && typeof params === 'object' && !Array.isArray(params)
+    ? params as Record<string, unknown>
+    : {};
+  return t(key, { ...interpolation, defaultValue: fallback });
+}
 
 function cleanToolUseErrorContent(content: unknown): string {
   return stringifyMessageContent(content)
@@ -75,6 +107,11 @@ function isRecoverableToolUseError(content: unknown): boolean {
   return !looksLikePermissionError;
 }
 
+function isWebSearchError(toolName: string | undefined): boolean {
+  const name = (toolName ?? '').toLowerCase();
+  return name === 'web_search' || name === 'websearch';
+}
+
 function getAttachmentTypeLabel(name?: string, mimeType?: string): string {
   const ext = String(name || '').split('.').pop()?.toUpperCase();
   if (ext && ext !== String(name || '').toUpperCase()) return ext;
@@ -91,7 +128,28 @@ function getAttachmentAccent(name?: string, mimeType?: string): string {
   return 'bg-neutral-500 text-white';
 }
 
-const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, onShowSettings, onGrantSessionToolPermission, autoExpandTools, showRawParameters, showThinking, selectedProject, provider, hideHeader = false }: MessageComponentProps) => {
+function attachmentToDocumentReference(attachment: ChatAttachment): ContentReference | null {
+  const structured = normalizeContentReference(attachment.contentReference);
+  if (structured) return structured;
+  if (attachment.kind !== DOCUMENT_SELECTION_ATTACHMENT_KIND || !attachment.selectedText) return null;
+  const filePath = attachment.filePath || attachment.path || '';
+  if (!filePath) return null;
+  return normalizeContentReference({
+    kind: DOCUMENT_SELECTION_ATTACHMENT_KIND,
+    id: `${filePath}-${attachment.createdAt || ''}-${attachment.occurrenceIndex ?? ''}`,
+    fileName: attachment.fileName || attachment.name,
+    filePath,
+    source: attachment.source === 'pdf' ? 'pdf' : 'office-pdf',
+    pageNumbers: Array.isArray(attachment.pageNumbers) ? attachment.pageNumbers : [],
+    selectedText: attachment.selectedText,
+    surroundingText: attachment.surroundingText,
+    occurrenceIndex: attachment.occurrenceIndex,
+    createdAt: attachment.createdAt || new Date(0).toISOString(),
+    truncated: attachment.truncated,
+  } satisfies DocumentSelectionReference);
+}
+
+const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, onShowSettings, onGrantSessionToolPermission, autoExpandTools, showRawParameters, showThinking, isToolSectionExpanded, onToolSectionExpandedChange, selectedProject, provider, hideHeader = false }: MessageComponentProps) => {
   const { t } = useTranslation('chat');
   const isGrouped = prevMessage && prevMessage.type === message.type &&
     ((prevMessage.type === 'assistant') ||
@@ -102,13 +160,29 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
   const [isExpanded, setIsExpanded] = useState(false);
   const permissionSuggestion = getPilotDeckPermissionSuggestion(message, provider);
   const [permissionGrantState, setPermissionGrantState] = useState<PermissionGrantState>('idle');
-  const messageContent = stringifyMessageContent(message.content);
-  const messageImages = Array.isArray(message.images)
-    ? message.images.filter((image) => image && typeof image.data === 'string')
-    : [];
+  const rawMessageContent = stringifyMessageContent(message.content);
+  const messageContent = translateDescriptor(t, message.contentI18n, rawMessageContent);
+  const userHintContent = translateDescriptor(t, message.userHintI18n, stringifyMessageContent(message.userHint));
   const messageAttachments = Array.isArray(message.attachments)
     ? message.attachments.filter((attachment) => attachment && typeof attachment.name === 'string')
     : [];
+  const documentReferenceAttachments = messageAttachments
+    .map(attachmentToDocumentReference)
+    .filter((reference): reference is ContentReference => Boolean(reference));
+  const referenceImageNames = new Set(documentReferenceAttachments
+    .filter((reference) => reference.selectionMode === 'region')
+    .map((reference) => reference.image.name));
+  const messageImages = Array.isArray(message.images)
+    ? message.images.filter((image) => (
+      image
+      && typeof image.data === 'string'
+      && !referenceImageNames.has(image.name)
+    ))
+    : [];
+  const fileAttachments = messageAttachments.filter((attachment) => (
+    attachment.kind !== DOCUMENT_SELECTION_ATTACHMENT_KIND
+    && attachment.kind !== CONTENT_REFERENCE_ATTACHMENT_KIND
+  ));
   const toolResultImages: LightboxImage[] = useMemo(
     () => {
       const list = (message.toolResult?.images ?? []) as Array<{ data?: unknown; name?: unknown; mimeType?: unknown }>;
@@ -137,6 +211,12 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
   const shouldShowAssistantCopyControl = message.type === 'assistant' &&
     assistantCopyContent.trim().length > 0 &&
     !message.isToolUse;
+  const toolSectionBaseKey = `${String(message.turnId || message.runId || 'legacy-turn')}:${String(
+    message.toolId || message.toolCallId || message.id || message.toolName || 'tool',
+  )}`;
+  const toolSectionKey = (section: 'input' | 'result' | 'error') => {
+    return `${toolSectionBaseKey}:${section}`;
+  };
 
 
   useEffect(() => {
@@ -152,6 +232,14 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
         entries.forEach((entry) => {
           if (entry.isIntersecting && !isExpanded) {
             setIsExpanded(true);
+            if (onToolSectionExpandedChange) {
+              if (message.toolInput) {
+                onToolSectionExpandedChange(`${toolSectionBaseKey}:input`, true);
+              }
+              if (message.toolResult && !message.toolResult.isError) {
+                onToolSectionExpandedChange(`${toolSectionBaseKey}:result`, true);
+              }
+            }
             const details = node.querySelectorAll<HTMLDetailsElement>('details:not([data-auto-expand="false"])');
             details.forEach((detail) => {
               detail.open = true;
@@ -167,7 +255,15 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
     return () => {
       observer.unobserve(node);
     };
-  }, [autoExpandTools, isExpanded, message.isToolUse]);
+  }, [
+    autoExpandTools,
+    isExpanded,
+    message.isToolUse,
+    message.toolInput,
+    message.toolResult,
+    onToolSectionExpandedChange,
+    toolSectionBaseKey,
+  ]);
 
   const formattedTime = useMemo(() => new Date(message.timestamp).toLocaleTimeString(), [message.timestamp]);
   const shouldHideThinkingMessage = Boolean(message.isThinking && !showThinking);
@@ -186,9 +282,24 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
         /* User message bubble on the right */
         <div className="flex w-full items-end space-x-0 sm:w-auto sm:max-w-[85%] sm:space-x-3 md:max-w-md lg:max-w-lg xl:max-w-xl">
           <div className="group flex-1 rounded-2xl rounded-br-md bg-blue-600 px-3 py-2 text-white shadow-sm sm:flex-initial sm:px-4">
-            {messageAttachments.length > 0 && (
+            {documentReferenceAttachments.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-2">
+                {documentReferenceAttachments.map((reference) => (
+                  <DocumentReferenceChip
+                    key={reference.id}
+                    reference={reference}
+                    summaryLength={100}
+                    className="bg-white/90 text-neutral-700"
+                    onOpen={onFileOpen
+                      ? () => onFileOpen(reference.source.relativePath)
+                      : undefined}
+                  />
+                ))}
+              </div>
+            )}
+            {fileAttachments.length > 0 && (
               <div className="mb-2 grid grid-cols-1 gap-2">
-                {messageAttachments.map((attachment, idx) => (
+                {fileAttachments.map((attachment, idx) => (
                   <div
                     key={`${attachment.name || 'attachment'}-${idx}`}
                     className="flex min-w-0 items-center gap-3 rounded-2xl bg-white/90 p-2.5 pr-3 text-neutral-900"
@@ -249,7 +360,12 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
           </span>
           {typeof message.preTokens === 'number' && (
             <span className="text-[11px] tabular-nums text-muted-foreground">
-              {t('compact.tokens', { tokens: message.preTokens.toLocaleString() })}
+              {typeof message.postTokens === 'number'
+                ? t('compact.tokensAfter', {
+                    before: message.preTokens.toLocaleString(),
+                    after: message.postTokens.toLocaleString(),
+                  })
+                : t('compact.tokens', { tokens: message.preTokens.toLocaleString() })}
             </span>
           )}
           <span className="text-[11px] tabular-nums text-muted-foreground">{formattedTime}</span>
@@ -323,7 +439,8 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
               <>
                 <div className="flex flex-col">
                   <div className="flex flex-col">
-                    <Markdown className="prose prose-sm max-w-none dark:prose-invert">
+                    <Markdown className="prose prose-sm max-w-none dark:prose-invert" projectName={selectedProject?.name}
+                      onFileOpen={onFileOpen}>
                       {String(message.displayText || '')}
                     </Markdown>
                   </div>
@@ -342,6 +459,9 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                     autoExpandTools={autoExpandTools}
                     showRawParameters={showRawParameters}
                     rawToolInput={typeof message.toolInput === 'string' ? message.toolInput : undefined}
+                    expansionKey={toolSectionKey('input')}
+                    isToolSectionExpanded={isToolSectionExpanded}
+                    onToolSectionExpandedChange={onToolSectionExpandedChange}
                     isSubagentContainer={message.isSubagentContainer}
                     subagentState={message.subagentState}
                   />
@@ -377,10 +497,79 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                   message.toolResult.isError ? (
                     <div id={`tool-result-${message.toolId}`} className="scroll-mt-4">
                       {(() => {
+                        if (isWebSearchError(message.toolName) && message.toolResult?.errorCode === 'setup_required') {
+                          return (
+                            <div className="my-1.5 overflow-hidden rounded-lg border border-amber-200 bg-amber-50/70 dark:border-amber-800/50 dark:bg-amber-950/20">
+                              <div className="flex items-start gap-3 px-4 py-3">
+                                <Search className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-600 dark:text-amber-400" />
+                                <div className="min-w-0 flex-1">
+                                  <div className="text-sm font-medium text-amber-800 dark:text-amber-200">
+                                    {t('toolUseError.webSearchNotConfigured.title', { defaultValue: 'Web Search Not Ready' })}
+                                  </div>
+                                  <div className="mt-1 text-xs leading-5 text-amber-700/90 dark:text-amber-300/80">
+                                    {t('toolUseError.webSearchNotConfigured.description', { defaultValue: 'The search API key is missing or invalid. Please go to Settings -> Config -> Search to check your search provider and API key.' })}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (typeof window !== 'undefined' && window.openSettings) {
+                                        window.openSettings('config:tools');
+                                      } else if (onShowSettings) {
+                                        onShowSettings();
+                                      }
+                                    }}
+                                    className="mt-2.5 inline-flex items-center gap-1.5 rounded-md border border-amber-300 bg-white/80 px-3 py-1.5 text-xs font-medium text-amber-800 transition-colors hover:bg-white dark:border-amber-700/60 dark:bg-amber-900/30 dark:text-amber-200 dark:hover:bg-amber-900/50"
+                                  >
+                                    <Settings className="h-3 w-3" />
+                                    {t('toolUseError.webSearchNotConfigured.openSettings', { defaultValue: 'Go to Settings' })}
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        }
+
                         const recoverableToolError = isRecoverableToolUseError(message.toolResult?.content);
                         const renderedErrorContent = recoverableToolError
                           ? cleanToolUseErrorContent(message.toolResult?.content)
                           : stringifyMessageContent(message.toolResult?.content);
+
+                        if (message.toolResult?.errorCode === 'setup_required') {
+                          return (
+                            <div className="my-1 flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-800/50 dark:bg-amber-950/30">
+                              <svg className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-500 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                              </svg>
+                              <div className="min-w-0 flex-1">
+                                <div className="text-sm font-medium text-amber-800 dark:text-amber-200">
+                                  {t('setupRequired.title', { defaultValue: 'Configuration needed' })}
+                                </div>
+                                <div className="mt-0.5 text-xs text-amber-700 dark:text-amber-300/80">
+                                  {renderedErrorContent}
+                                </div>
+                                {onShowSettings && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (typeof window !== 'undefined' && window.openSettings) {
+                                        window.openSettings('config');
+                                      } else {
+                                        onShowSettings();
+                                      }
+                                    }}
+                                    className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-amber-300 bg-white/80 px-3 py-1.5 text-xs font-medium text-amber-800 transition-colors hover:bg-white dark:border-amber-700 dark:bg-amber-900/40 dark:text-amber-200 dark:hover:bg-amber-900/60"
+                                  >
+                                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                    </svg>
+                                    {t('setupRequired.openSettings', { defaultValue: 'Open Settings' })}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        }
 
                         if (!permissionSuggestion) {
                           return (
@@ -389,10 +578,15 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                               toolId={message.toolId}
                               title={t('toolUseError.title', { defaultValue: 'Tool error' })}
                               defaultOpen={false}
+                              open={isToolSectionExpanded?.(toolSectionKey('error'), false)}
+                              onOpenChange={onToolSectionExpandedChange
+                                ? (expanded) => onToolSectionExpandedChange(toolSectionKey('error'), expanded)
+                                : undefined}
                               toolCategory="default"
                               autoExpandable={false}
                             >
-                              <Markdown className="prose prose-sm max-w-none dark:prose-invert">
+                              <Markdown className="prose prose-sm max-w-none dark:prose-invert" projectName={selectedProject?.name}
+                      onFileOpen={onFileOpen}>
                                 {renderedErrorContent}
                               </Markdown>
                             </CollapsibleDisplay>
@@ -401,8 +595,20 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
 
                         return (
                           <div className="my-1 border-l-2 border-l-red-500 py-0.5 pl-3 dark:border-l-red-400">
-                            <details className="group/details relative">
-                              <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs font-medium text-red-600 transition-colors hover:text-red-700 dark:text-red-300 dark:hover:text-red-200 [&::-webkit-details-marker]:hidden">
+                            <details
+                              className="group/details relative"
+                              open={isToolSectionExpanded?.(toolSectionKey('error'), false)}
+                            >
+                              <summary
+                                onClick={onToolSectionExpandedChange
+                                  ? (event) => {
+                                      event.preventDefault();
+                                      const currentExpanded = isToolSectionExpanded?.(toolSectionKey('error'), false) ?? false;
+                                      onToolSectionExpandedChange(toolSectionKey('error'), !currentExpanded);
+                                    }
+                                  : undefined}
+                                className="flex cursor-pointer list-none items-center gap-1.5 text-xs font-medium text-red-600 transition-colors hover:text-red-700 dark:text-red-300 dark:hover:text-red-200 [&::-webkit-details-marker]:hidden"
+                              >
                                 <svg
                                   className="h-3.5 w-3.5 transition-transform group-open/details:rotate-90"
                                   fill="none"
@@ -427,7 +633,8 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                                 ) : null}
                               </summary>
                               <div className="mt-1.5 pl-[18px] text-xs leading-5 text-gray-700 dark:text-gray-300">
-                                <Markdown className="prose prose-sm prose-red max-w-none dark:prose-invert">
+                                <Markdown className="prose prose-sm prose-red max-w-none dark:prose-invert" projectName={selectedProject?.name}
+                      onFileOpen={onFileOpen}>
                                   {renderedErrorContent}
                                 </Markdown>
                                 <div className="mt-3 border-t border-red-200/60 pt-3 dark:border-red-800/60">
@@ -437,7 +644,14 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                                       onClick={() => {
                                         if (!onGrantSessionToolPermission) return;
                                         const result = onGrantSessionToolPermission(permissionSuggestion);
-                                        if (result?.success) {
+                                        if (result?.pending && result.completion) {
+                                          setPermissionGrantState('idle');
+                                          result.completion.then((completion) => {
+                                            setPermissionGrantState(completion.success ? 'granted' : 'error');
+                                          }).catch(() => {
+                                            setPermissionGrantState('error');
+                                          });
+                                        } else if (result?.success) {
                                           setPermissionGrantState('granted');
                                         } else {
                                           setPermissionGrantState('error');
@@ -508,6 +722,9 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                         createDiff={createDiff}
                         selectedProject={selectedProject}
                         autoExpandTools={autoExpandTools}
+                        expansionKey={toolSectionKey('result')}
+                        isToolSectionExpanded={isToolSectionExpanded}
+                        onToolSectionExpandedChange={onToolSectionExpandedChange}
                         isSubagentContainer={message.isSubagentContainer}
                         subagentState={message.subagentState}
                       />
@@ -607,7 +824,8 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                     <span>{t('thinking.emoji')}</span>
                   </summary>
                   <div className="mt-2 border-l-2 border-gray-300 pl-4 text-sm text-gray-600 dark:border-gray-600 dark:text-gray-400">
-                    <Markdown className="prose prose-sm prose-gray max-w-none dark:prose-invert">
+                    <Markdown className="prose prose-sm prose-gray max-w-none dark:prose-invert" projectName={selectedProject?.name}
+                      onFileOpen={onFileOpen}>
                       {messageContent}
                     </Markdown>
                   </div>
@@ -664,7 +882,8 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
 
                   // Normal rendering for non-JSON content
                   return message.type === 'assistant' ? (
-                    <Markdown className="prose prose-sm prose-gray max-w-none dark:prose-invert">
+                    <Markdown className="prose prose-sm prose-gray max-w-none dark:prose-invert" projectName={selectedProject?.name}
+                      onFileOpen={onFileOpen}>
                       {content}
                     </Markdown>
                   ) : (
@@ -673,6 +892,15 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                     </div>
                   );
                 })()}
+
+                {message.type === 'error' && userHintContent && (
+                  <div className="mt-2 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 dark:border-amber-800/50 dark:bg-amber-950/30">
+                    <svg className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-500 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                    </svg>
+                    <span className="text-xs text-amber-700 dark:text-amber-300">{userHintContent}</span>
+                  </div>
+                )}
               </div>
             )}
 

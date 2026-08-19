@@ -1,9 +1,17 @@
 // @vitest-environment jsdom
 import React from 'react';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { ChatMessage, ChatRunMode } from '../chat/types/types';
+import { FindShortcutProvider } from '../../contexts/FindShortcutContext';
+import type { ChatMessage, ChatRunMode, SessionRuntimeState } from '../chat/types/types';
 import MessagesPaneV2 from './MessagesPaneV2';
+import { getContextStatus } from './ComposerV2';
+
+vi.mock('./SubagentDetailModal', () => ({
+  default: ({ isRunning }: { isRunning?: boolean }) => (
+    <div data-testid="subagent-detail-modal" data-running={isRunning ? 'true' : 'false'} />
+  ),
+}));
 
 beforeAll(() => {
   class ResizeObserverMock {
@@ -16,10 +24,42 @@ beforeAll(() => {
     return window.setTimeout(() => callback(performance.now()), 0);
   });
   vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id));
+  Element.prototype.scrollIntoView = vi.fn();
 });
 
 afterEach(() => {
   cleanup();
+});
+
+describe('getContextStatus', () => {
+  it('keeps the visible count and percentage on the same display-token basis', () => {
+    const status = getContextStatus({
+      displayUsed: 11_928,
+      budgetUsed: 12_080,
+      total: 12_000,
+      effectiveTotal: 12_000,
+      state: 'blocking',
+    });
+
+    expect(status.used).toBe(11_928);
+    expect(status.percentLabel).toBe('99%');
+    // The padded request budget still controls the policy severity.
+    expect(status.state).toBe('blocking');
+    expect(status.tone).toBe('red');
+  });
+
+  it('prefers the resolved token count over a stale display estimate', () => {
+    const status = getContextStatus({
+      used: 12_080,
+      displayUsed: 11_928,
+      total: 12_000,
+      effectiveTotal: 12_000,
+      state: 'blocking',
+    });
+
+    expect(status.used).toBe(12_080);
+    expect(status.percentLabel).toBe('100%+');
+  });
 });
 
 function makeMessage(index: number): ChatMessage {
@@ -35,40 +75,57 @@ function createPaneElement({
   messages,
   activityMessages = [],
   isAssistantWorking = false,
+  sessionRuntimeState = 'synchronizing',
+  activeRunId = null,
   runMode = 'agent',
+  planModeActive = false,
+  showThinking = true,
+  inlineThinking = false,
 }: {
   messages: ChatMessage[];
   activityMessages?: ChatMessage[];
   isAssistantWorking?: boolean;
+  sessionRuntimeState?: SessionRuntimeState;
+  activeRunId?: string | null;
   runMode?: ChatRunMode;
+  planModeActive?: boolean;
+  showThinking?: boolean;
+  inlineThinking?: boolean;
 }) {
   const scrollContainerRef = React.createRef<HTMLDivElement>();
 
   return (
-    <MessagesPaneV2
-      scrollContainerRef={scrollContainerRef}
-      onWheel={() => {}}
-      onTouchMove={() => {}}
-      isLoadingSessionMessages={false}
-      chatMessages={messages}
-      activityMessages={activityMessages}
-      visibleMessages={messages}
-      visibleMessageCount={messages.length}
-      isLoadingMoreMessages={false}
-      hasMoreMessages={false}
-      totalMessages={messages.length}
-      loadEarlierMessages={() => {}}
-      loadAllMessages={() => {}}
-      allMessagesLoaded
-      isLoadingAllMessages={false}
-      provider="pilotdeck"
-      selectedProject={null}
-      selectedSession={null}
-      createDiff={() => []}
-      setInput={() => {}}
-      isAssistantWorking={isAssistantWorking}
-      runMode={runMode}
-    />
+    <FindShortcutProvider activeScope="chat">
+      <MessagesPaneV2
+        scrollContainerRef={scrollContainerRef}
+        onWheel={() => {}}
+        onTouchMove={() => {}}
+        isLoadingSessionMessages={false}
+        chatMessages={messages}
+        activityMessages={activityMessages}
+        visibleMessages={messages}
+        visibleMessageCount={messages.length}
+        isLoadingMoreMessages={false}
+        hasMoreMessages={false}
+        totalMessages={messages.length}
+        loadEarlierMessages={() => {}}
+        loadAllMessages={() => {}}
+        allMessagesLoaded
+        isLoadingAllMessages={false}
+        provider="pilotdeck"
+        selectedProject={null}
+        selectedSession={null}
+        createDiff={() => []}
+        setInput={() => {}}
+        isAssistantWorking={isAssistantWorking}
+        sessionRuntimeState={sessionRuntimeState}
+        activeRunId={activeRunId}
+        runMode={runMode}
+        planModeActive={planModeActive}
+        showThinking={showThinking}
+        inlineThinking={inlineThinking}
+      />
+    </FindShortcutProvider>
   );
 }
 
@@ -76,12 +133,418 @@ function renderPane(options: {
   messages: ChatMessage[];
   activityMessages?: ChatMessage[];
   isAssistantWorking?: boolean;
+  sessionRuntimeState?: SessionRuntimeState;
+  activeRunId?: string | null;
   runMode?: ChatRunMode;
+  planModeActive?: boolean;
+  showThinking?: boolean;
+  inlineThinking?: boolean;
 }) {
   return render(createPaneElement(options));
 }
 
+function SessionPaneHarness({
+  sessionId,
+  messages,
+}: {
+  sessionId: string;
+  messages: ChatMessage[];
+}) {
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null);
+  return (
+    <FindShortcutProvider activeScope="chat">
+      <MessagesPaneV2
+        scrollContainerRef={scrollContainerRef}
+        onWheel={() => {}}
+        onTouchMove={() => {}}
+        isLoadingSessionMessages={false}
+        chatMessages={messages}
+        visibleMessages={messages}
+        visibleMessageCount={messages.length}
+        isLoadingMoreMessages={false}
+        hasMoreMessages={false}
+        totalMessages={messages.length}
+        loadEarlierMessages={() => {}}
+        loadAllMessages={() => {}}
+        allMessagesLoaded
+        isLoadingAllMessages={false}
+        provider="pilotdeck"
+        selectedProject={{ name: 'project', displayName: 'Project', fullPath: '/project' }}
+        selectedSession={{ id: sessionId }}
+        createDiff={() => []}
+        setInput={() => {}}
+      />
+    </FindShortcutProvider>
+  );
+}
+
 describe('MessagesPaneV2 render behavior', () => {
+  it('shows a waiting state before the model produces content', () => {
+    const now = new Date().toISOString();
+    renderPane({
+      messages: [{
+        id: 'user-waiting',
+        type: 'user',
+        content: 'Please analyze this.',
+        timestamp: now,
+      }],
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running',
+    });
+
+    expect(screen.getByText('Waiting for model response...')).toBeTruthy();
+    expect(screen.queryByText('Thinking...')).toBeNull();
+  });
+
+  it('switches to thinking when live reasoning arrives even if reasoning details are hidden', () => {
+    const now = new Date().toISOString();
+    renderPane({
+      messages: [
+        {
+          id: 'user-thinking',
+          type: 'user',
+          content: 'Please analyze this.',
+          timestamp: now,
+        },
+        {
+          id: '__streaming_thinking_session_run',
+          type: 'assistant',
+          content: 'I am comparing the available approaches.',
+          timestamp: now,
+          isThinking: true,
+          isStreaming: true,
+        },
+      ],
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running',
+      showThinking: false,
+    });
+
+    expect(screen.getByText('Thinking...')).toBeTruthy();
+    expect(screen.queryByText('Waiting for model response...')).toBeNull();
+    expect(screen.queryByText('I am comparing the available approaches.')).toBeNull();
+  });
+
+  it('lets the live thinking status row collapse and restore the scrollable reasoning window', () => {
+    const now = new Date().toISOString();
+    const thinkingContent = Array.from(
+      { length: 12 },
+      (_, index) => `Live thinking line ${index + 1}`,
+    ).join('\n');
+    renderPane({
+      messages: [
+        {
+          id: 'user-live-thinking',
+          type: 'user',
+          content: 'Please think this through.',
+          timestamp: now,
+        },
+        {
+          id: '__streaming_thinking_session_live',
+          type: 'assistant',
+          content: thinkingContent,
+          timestamp: now,
+          isThinking: true,
+          isStreaming: true,
+        },
+      ],
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running',
+    });
+
+    const toggle = screen.getByRole('button', { name: 'Thinking...' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    const liveThinkingRegion = screen.getByRole('region', { name: 'Live thinking content' });
+    expect(liveThinkingRegion).toBeTruthy();
+    expect(liveThinkingRegion.closest('[role="status"]')).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('region', { name: 'Live thinking content' })).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('region', { name: 'Live thinking content' })).toBeTruthy();
+  });
+
+  it('expands live reasoning when thinking details are enabled during a run', () => {
+    const now = new Date().toISOString();
+    const messages: ChatMessage[] = [
+      {
+        id: 'user-toggle-thinking',
+        type: 'user',
+        content: 'Please think this through.',
+        timestamp: now,
+      },
+      {
+        id: '__streaming_thinking_toggle_details',
+        type: 'assistant',
+        content: 'Reasoning that becomes visible later.',
+        timestamp: now,
+        isThinking: true,
+        isStreaming: true,
+      },
+    ];
+    const options = {
+      messages,
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running' as const,
+    };
+    const view = renderPane({ ...options, showThinking: false });
+
+    expect(screen.queryByRole('region', { name: 'Live thinking content' })).toBeNull();
+
+    view.rerender(createPaneElement({ ...options, showThinking: true }));
+
+    expect(screen.getByRole('button', { name: 'Thinking...' }).getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('region', { name: 'Live thinking content' })).toBeTruthy();
+  });
+
+  it('expands the reasoning window when switching away from inline thinking during a run', () => {
+    const now = new Date().toISOString();
+    const messages: ChatMessage[] = [
+      {
+        id: 'user-toggle-inline-thinking',
+        type: 'user',
+        content: 'Please think this through.',
+        timestamp: now,
+      },
+      {
+        id: '__streaming_thinking_toggle_inline',
+        type: 'assistant',
+        content: 'Reasoning that moves out of the inline message.',
+        timestamp: now,
+        isThinking: true,
+        isStreaming: true,
+      },
+    ];
+    const options = {
+      messages,
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running' as const,
+    };
+    const view = renderPane({ ...options, inlineThinking: true });
+
+    expect(screen.queryByRole('region', { name: 'Live thinking content' })).toBeNull();
+
+    view.rerender(createPaneElement({ ...options, inlineThinking: false }));
+
+    expect(screen.getByRole('button', { name: 'Thinking...' }).getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('region', { name: 'Live thinking content' })).toBeTruthy();
+  });
+
+  it('stops an unfinished subagent from an older run while the next run is active', () => {
+    const now = new Date().toISOString();
+    const messages: ChatMessage[] = [
+      {
+        id: 'old-user',
+        type: 'user',
+        content: '上一轮',
+        timestamp: now,
+        runId: 'run-old',
+        turnId: 'run-old',
+      },
+      {
+        id: 'old-subagent',
+        type: 'assistant',
+        content: '',
+        timestamp: now,
+        runId: 'run-old',
+        turnId: 'run-old',
+        isToolUse: true,
+        isSubagentContainer: true,
+        toolName: 'Agent',
+        toolId: 'old-subagent',
+        subagentId: 'subagent-old',
+        toolInput: JSON.stringify({ description: 'Historical subagent' }),
+      },
+      {
+        id: 'new-user',
+        type: 'user',
+        content: '新一轮',
+        timestamp: now,
+        runId: 'run-new',
+        turnId: 'run-new',
+      },
+      {
+        id: 'new-assistant',
+        type: 'assistant',
+        content: 'Working on the new turn.',
+        timestamp: now,
+        runId: 'run-new',
+        turnId: 'run-new',
+      },
+    ];
+
+    renderPane({
+      messages,
+      activityMessages: [{
+        id: 'old-subagent-activity',
+        type: 'assistant',
+        timestamp: now,
+        isAgentActivity: true,
+        activityId: 'subagent:subagent-old',
+        parentRunId: 'run-old',
+        phase: 'subagent',
+        state: 'running',
+      }],
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running',
+      activeRunId: 'run-new',
+    });
+
+    const card = screen.getByText('Historical subagent').closest('[role="button"]');
+    expect(card).not.toBeNull();
+    expect(within(card as HTMLElement).getByText('subagent.status.stopped')).toBeTruthy();
+    expect(within(card as HTMLElement).queryByText('subagent.status.thinking')).toBeNull();
+    expect(screen.queryByText('Waiting for subagent')).toBeNull();
+    fireEvent.click(card as HTMLElement);
+    expect(screen.getByTestId('subagent-detail-modal').getAttribute('data-running')).toBe('false');
+  });
+
+  it('keeps an unfinished subagent in the active run running', () => {
+    const now = new Date().toISOString();
+    const messages: ChatMessage[] = [
+      {
+        id: 'new-user',
+        type: 'user',
+        content: '新一轮',
+        timestamp: now,
+        runId: 'run-new',
+        turnId: 'run-new',
+      },
+      {
+        id: 'new-subagent',
+        type: 'assistant',
+        content: '',
+        timestamp: now,
+        runId: 'run-new',
+        turnId: 'run-new',
+        isToolUse: true,
+        isSubagentContainer: true,
+        toolName: 'Agent',
+        toolId: 'new-subagent',
+        subagentId: 'subagent-new',
+        toolInput: JSON.stringify({ description: 'Current subagent' }),
+      },
+    ];
+
+    renderPane({
+      messages,
+      activityMessages: [{
+        id: 'new-subagent-activity',
+        type: 'assistant',
+        timestamp: now,
+        isAgentActivity: true,
+        activityId: 'subagent:subagent-new',
+        parentRunId: 'run-new',
+        phase: 'subagent',
+        state: 'running',
+      }],
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running',
+      activeRunId: 'run-new',
+    });
+
+    const card = screen.getByText('Current subagent').closest('[role="button"]');
+    expect(card).not.toBeNull();
+    expect(within(card as HTMLElement).getByText('subagent.status.thinking')).toBeTruthy();
+    expect(within(card as HTMLElement).queryByText('subagent.status.stopped')).toBeNull();
+    fireEvent.click(card as HTMLElement);
+    expect(screen.getByTestId('subagent-detail-modal').getAttribute('data-running')).toBe('true');
+  });
+
+  it('uses a running activity from the active parent run for the live status', () => {
+    const now = new Date().toISOString();
+    renderPane({
+      messages: [{
+        id: 'new-user',
+        type: 'user',
+        content: '新一轮',
+        timestamp: now,
+        runId: 'run-new',
+        turnId: 'run-new',
+      }],
+      activityMessages: [{
+        id: 'new-subagent-activity',
+        type: 'assistant',
+        timestamp: now,
+        isAgentActivity: true,
+        activityId: 'subagent:subagent-new',
+        parentRunId: 'run-new',
+        phase: 'subagent',
+        state: 'running',
+      }],
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running',
+      activeRunId: 'run-new',
+    });
+
+    expect(screen.getByText('Waiting for subagent')).toBeTruthy();
+  });
+
+  it('uses message position for legacy subagents only after an active run is confirmed', () => {
+    const now = new Date().toISOString();
+    const legacyMessages: ChatMessage[] = [
+      {
+        id: 'old-user',
+        type: 'user',
+        content: '上一轮',
+        timestamp: now,
+      },
+      {
+        id: 'legacy-subagent',
+        type: 'assistant',
+        content: '',
+        timestamp: now,
+        isToolUse: true,
+        isSubagentContainer: true,
+        toolName: 'Agent',
+        toolId: 'legacy-subagent',
+        subagentId: 'subagent-legacy',
+        toolInput: JSON.stringify({ description: 'Legacy subagent' }),
+      },
+      {
+        id: 'new-user',
+        type: 'user',
+        content: '新一轮',
+        timestamp: now,
+        runId: 'run-new',
+        turnId: 'run-new',
+      },
+    ];
+
+    const { rerender } = renderPane({
+      messages: legacyMessages,
+      isAssistantWorking: true,
+      sessionRuntimeState: 'synchronizing',
+      activeRunId: null,
+    });
+    let card = screen.getByText('Legacy subagent').closest('[role="button"]');
+    expect(card).not.toBeNull();
+    expect(within(card as HTMLElement).getByText('subagent.status.thinking')).toBeTruthy();
+
+    rerender(createPaneElement({
+      messages: legacyMessages,
+      isAssistantWorking: true,
+      sessionRuntimeState: 'running',
+      activeRunId: 'run-new',
+    }));
+    card = screen.getByText('Legacy subagent').closest('[role="button"]');
+    expect(card).not.toBeNull();
+    expect(within(card as HTMLElement).getByText('subagent.status.stopped')).toBeTruthy();
+  });
+
+  it('renders the default 100-message window without virtualization', () => {
+    const messages = Array.from({ length: 100 }, (_, index) => makeMessage(index));
+
+    renderPane({ messages });
+
+    const container = screen.getByText('Message 0').closest('[data-total-message-count]');
+    expect(container?.getAttribute('data-virtualized-messages')).toBeNull();
+    expect(container?.getAttribute('data-rendered-message-count')).toBe('100');
+  });
+
   it('renders only the viewport window for large conversations', () => {
     const messages = Array.from({ length: 220 }, (_, index) => makeMessage(index));
 
@@ -91,6 +554,59 @@ describe('MessagesPaneV2 render behavior', () => {
     expect(container?.getAttribute('data-virtualized-messages')).toBe('true');
     expect(container?.getAttribute('data-total-message-count')).toBe('220');
     expect(Number(container?.getAttribute('data-rendered-message-count'))).toBeLessThan(220);
+  });
+
+  it('keeps a live process status visible when the process fragment has no renderable anchor', () => {
+    const now = new Date().toISOString();
+    const messages: ChatMessage[] = Array.from({ length: 4 }, (_, index) => ({
+      id: `tool-${index}`,
+      type: 'assistant',
+      content: '',
+      timestamp: now,
+      isToolUse: true,
+      toolName: 'Read',
+      toolId: `tool-${index}`,
+      toolInput: JSON.stringify({ file_path: `src/Orphaned-${index}.tsx` }),
+    }));
+
+    const { container } = renderPane({ messages, isAssistantWorking: true });
+
+    expect(container.querySelector('[data-total-message-count]')?.getAttribute('data-total-message-count')).toBe('0');
+    expect(screen.getByText('Reading Orphaned-3.tsx')).toBeTruthy();
+  });
+
+  it('resynchronizes a virtual window when the mounted pane changes sessions', async () => {
+    const sessionAMessages = Array.from({ length: 220 }, (_, index) => ({
+      ...makeMessage(index),
+      content: `Session A message ${index}`,
+    }));
+    const sessionBMessages = Array.from({ length: 220 }, (_, index) => ({
+      ...makeMessage(index),
+      content: `Session B message ${index}`,
+    }));
+    const view = render(
+      <SessionPaneHarness sessionId="session-a" messages={sessionAMessages} />,
+    );
+    const scrollSurface = view.container.querySelector<HTMLElement>('[data-chat-search-surface]');
+    expect(scrollSurface).not.toBeNull();
+    Object.defineProperty(scrollSurface, 'clientHeight', { configurable: true, value: 800 });
+
+    scrollSurface!.scrollTop = 5000;
+    fireEvent.scroll(scrollSurface!);
+    await waitFor(() => {
+      expect(screen.queryByText('Session A message 0')).toBeNull();
+    });
+
+    // Simulate the browser clamping the reused element without dispatching a
+    // scroll event while React replaces the conversation contents.
+    scrollSurface!.scrollTop = 0;
+    view.rerender(
+      <SessionPaneHarness sessionId="session-b" messages={sessionBMessages} />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Session B message 0')).toBeTruthy();
+    });
   });
 
   it('renders live processing time above the active assistant turn with activity status', () => {
@@ -412,6 +928,212 @@ describe('MessagesPaneV2 render behavior', () => {
     expect(screen.getByText('ReadHidden.tsx')).toBeTruthy();
   });
 
+  it('preserves expanded tool parameters when live ids are replaced by persisted ids', async () => {
+    const now = new Date().toISOString();
+    const liveMessages: ChatMessage[] = [
+      {
+        id: 'live-user-frame',
+        turnId: 'turn-1',
+        runId: 'turn-1',
+        type: 'user',
+        content: '检查代码',
+        timestamp: now,
+      },
+      {
+        id: 'live-assistant-frame',
+        turnId: 'turn-1',
+        runId: 'turn-1',
+        type: 'assistant',
+        content: '我先运行检查。',
+        timestamp: now,
+      },
+      {
+        id: 'live-tool-frame',
+        turnId: 'turn-1',
+        runId: 'turn-1',
+        type: 'assistant',
+        content: '',
+        timestamp: now,
+        isToolUse: true,
+        toolName: 'execute_code',
+        toolId: 'call-stable-1',
+        toolInput: '{"code":"print(1)"}',
+      },
+    ];
+    const { container, rerender } = renderPane({ messages: liveMessages, isAssistantWorking: true });
+
+    const processButton = container.querySelector<HTMLButtonElement>('.process-live-status button');
+    expect(processButton).not.toBeNull();
+    fireEvent.click(processButton as HTMLButtonElement);
+
+    const parametersSummary = screen.getByText('Parameters').closest('summary');
+    const parametersDetails = parametersSummary?.closest('details') as HTMLDetailsElement | null;
+    expect(parametersDetails?.open).toBe(false);
+    fireEvent.click(parametersSummary as HTMLElement);
+    await waitFor(() => expect(parametersDetails?.open).toBe(true));
+
+    const persistedMessages: ChatMessage[] = [
+      {
+        ...liveMessages[0],
+        id: 'persisted-user-entry',
+      },
+      {
+        ...liveMessages[1],
+        id: 'persisted-assistant-entry',
+      },
+      {
+        ...liveMessages[2],
+        id: 'persisted-tool-entry',
+        toolResult: { content: '1', isError: false },
+      },
+      {
+        id: 'persisted-final-answer',
+        turnId: 'turn-1',
+        runId: 'turn-1',
+        type: 'assistant',
+        content: '检查完成。',
+        timestamp: now,
+      },
+    ];
+    rerender(createPaneElement({ messages: persistedMessages }));
+
+    const completedProcessButton = screen.getByText('Ran 1 command').closest('button');
+    expect(completedProcessButton?.getAttribute('aria-expanded')).toBe('true');
+    const persistedParameters = screen.getByText('Parameters').closest('details') as HTMLDetailsElement | null;
+    expect(persistedParameters?.open).toBe(true);
+  });
+
+  it('does not search hidden completed process detail content', async () => {
+    const now = new Date().toISOString();
+    const messages: ChatMessage[] = [
+      {
+        id: 'u-1',
+        type: 'user',
+        content: '检查文件',
+        timestamp: now,
+      },
+      {
+        id: 'tool-read-1',
+        type: 'assistant',
+        content: '',
+        timestamp: now,
+        isToolUse: true,
+        toolName: 'Read',
+        toolId: 'tool-read-1',
+        toolInput: '{"file_path":"src/SearchHiddenNeedle.tsx"}',
+        toolResult: { content: 'ok', isError: false },
+      },
+      {
+        id: 'a-1',
+        type: 'assistant',
+        content: 'Done.',
+        timestamp: now,
+      },
+    ];
+
+    renderPane({ messages });
+
+    const summary = screen.getByText('Explored 1 file');
+    const processButton = summary.closest('button');
+    expect(processButton?.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByText('SearchHiddenNeedle.tsx')).toBeNull();
+
+    fireEvent.keyDown(document, { key: 'f', ctrlKey: true });
+    const search = screen.getByRole('search');
+    const input = search.querySelector('input[type="search"]') as HTMLInputElement | null;
+    if (!input) throw new Error('Expected chat search input');
+    fireEvent.change(input, { target: { value: 'SearchHiddenNeedle.tsx' } });
+
+    await waitFor(() => {
+      expect((screen.getByRole('button', { name: 'Previous match' }) as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByRole('button', { name: 'Next match' }) as HTMLButtonElement).disabled).toBe(true);
+    });
+    expect(processButton?.getAttribute('aria-expanded')).toBe('false');
+    expect(document.querySelector('mark.chat-history-search-highlight-active')).toBeNull();
+  });
+
+  it('does not capture the find shortcut from an active file search surface', () => {
+    renderPane({ messages: [makeMessage(0)] });
+    const fileSurface = document.createElement('div');
+    fileSurface.dataset.fileSearchSurface = '';
+    const fileInput = document.createElement('input');
+    fileSurface.append(fileInput);
+    document.body.append(fileSurface);
+
+    fireEvent.keyDown(fileInput, { key: 'f', ctrlKey: true });
+
+    expect(screen.queryByRole('search')).toBeNull();
+    fileSurface.remove();
+  });
+
+  it('moves between mounted search results without resetting the conversation scroll position', async () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'u-search-1',
+        type: 'user',
+        content: 'First visible needle',
+        timestamp: new Date().toISOString(),
+      },
+      {
+        id: 'a-search-2',
+        type: 'assistant',
+        content: 'Second visible needle',
+        timestamp: new Date().toISOString(),
+      },
+    ];
+
+    renderPane({ messages });
+
+    const messageList = screen.getByText('First visible needle').closest('[data-total-message-count]');
+    const scrollContainer = messageList?.parentElement as HTMLElement | null;
+    if (!scrollContainer) throw new Error('Expected conversation scroll container');
+
+    let currentScrollTop = 240;
+    const setScrollTop = vi.fn((value: number) => {
+      currentScrollTop = value;
+    });
+    const scrollTo = vi.fn();
+    Object.defineProperty(scrollContainer, 'scrollTop', {
+      configurable: true,
+      get: () => currentScrollTop,
+      set: setScrollTop,
+    });
+    Object.defineProperty(scrollContainer, 'clientHeight', {
+      configurable: true,
+      value: 400,
+    });
+    scrollContainer.scrollTo = scrollTo;
+
+    fireEvent.keyDown(document, { key: 'f', ctrlKey: true });
+    const searchInput = screen.getByRole('search').querySelector('input[type="search"]');
+    if (!(searchInput instanceof HTMLInputElement)) throw new Error('Expected chat search input');
+    fireEvent.change(searchInput, { target: { value: 'needle' } });
+
+    await waitFor(() => {
+      expect(scrollTo).toHaveBeenCalled();
+      expect(document.querySelectorAll('mark.chat-history-search-highlight')).toHaveLength(2);
+      expect(document.querySelectorAll('mark.chat-history-search-highlight-active')).toHaveLength(1);
+    });
+    expect(
+      document.querySelector('mark.chat-history-search-highlight-active')?.closest('[data-message-key]')
+        ?.getAttribute('data-message-key'),
+    ).toContain('u-search-1');
+    scrollTo.mockClear();
+    setScrollTop.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next match' }));
+
+    await waitFor(() => expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({
+      behavior: 'smooth',
+    })));
+    expect(document.querySelectorAll('mark.chat-history-search-highlight')).toHaveLength(2);
+    expect(
+      document.querySelector('mark.chat-history-search-highlight-active')?.closest('[data-message-key]')
+        ?.getAttribute('data-message-key'),
+    ).toContain('a-search-2');
+    expect(setScrollTop).not.toHaveBeenCalled();
+  });
+
   it('keeps separated live process rows at the positions where they happened', () => {
     const now = new Date().toISOString();
     const messages: ChatMessage[] = [
@@ -471,8 +1193,9 @@ describe('MessagesPaneV2 render behavior', () => {
     const firstStatusContainer = firstStatus.closest('[role="status"]');
     expect(firstStatusContainer).not.toBeNull();
     if (!firstStatusContainer) throw new Error('Expected first inline status container');
-    expect(firstStatusContainer.parentElement?.className).toContain('mt-2');
-    expect(firstStatusContainer.parentElement?.className).toContain('gap-2');
+    const firstProcessRow = firstStatusContainer.closest('.process-live-status');
+    expect(firstProcessRow?.parentElement?.className).toContain('mt-2');
+    expect(firstProcessRow?.parentElement?.className).toContain('gap-2');
     const expandButton = firstStatusContainer.querySelector('button');
     expect(expandButton).not.toBeNull();
 
@@ -666,6 +1389,70 @@ describe('MessagesPaneV2 render behavior', () => {
     expect(container.querySelector('.border-l-red-500')).toBeNull();
   });
 
+  it('shows a waiting status below an in-progress web_fetch in plan mode', () => {
+    const now = new Date().toISOString();
+    const messages: ChatMessage[] = [
+      {
+        id: 'u-1',
+        type: 'user',
+        content: '搜索一下',
+        timestamp: now,
+      },
+      {
+        id: 'a-1',
+        type: 'assistant',
+        content: '我去查一下文档。',
+        timestamp: now,
+      },
+      {
+        id: 'tool-fetch-1',
+        type: 'assistant',
+        content: '',
+        timestamp: now,
+        isToolUse: true,
+        toolName: 'web_fetch',
+        toolId: 'tool-fetch-1',
+        toolInput: '{"url":"https://example.com"}',
+      },
+    ];
+
+    renderPane({ messages, isAssistantWorking: true, runMode: 'plan', planModeActive: true });
+
+    expect(screen.getByText('Fetching web content...')).toBeTruthy();
+  });
+
+  it('does not show the web_fetch waiting status in agent mode', () => {
+    const now = new Date().toISOString();
+    const messages: ChatMessage[] = [
+      {
+        id: 'u-1',
+        type: 'user',
+        content: '搜索一下',
+        timestamp: now,
+      },
+      {
+        id: 'a-1',
+        type: 'assistant',
+        content: '我去查一下文档。',
+        timestamp: now,
+      },
+      {
+        id: 'tool-fetch-1',
+        type: 'assistant',
+        content: '',
+        timestamp: now,
+        isToolUse: true,
+        toolName: 'web_fetch',
+        toolId: 'tool-fetch-1',
+        toolInput: '{"url":"https://example.com"}',
+      },
+    ];
+
+    renderPane({ messages, isAssistantWorking: true, runMode: 'agent' });
+
+    expect(screen.queryByText('Fetching web content...')).toBeNull();
+  });
+
   it('does not render a completed compact boundary as a plan-mode process row', () => {
     const now = new Date().toISOString();
     const messages: ChatMessage[] = [
@@ -690,7 +1477,7 @@ describe('MessagesPaneV2 render behavior', () => {
       },
     ];
 
-    renderPane({ messages, isAssistantWorking: true, runMode: 'plan' });
+    renderPane({ messages, isAssistantWorking: true, runMode: 'plan', planModeActive: true });
 
     expect(screen.getByText('I will make a plan first.')).toBeTruthy();
     expect(screen.queryByText('Compacted context')).toBeNull();

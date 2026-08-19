@@ -57,6 +57,7 @@ export type DiscoveryPlanStatus =
   | "ready"
   | "executing"
   | "completed"
+  | "completed_no_report"
   | "failed"
   | "archived";
 
@@ -142,7 +143,8 @@ export type GateBlockReason =
   | "recent_user_msg"
   | "cooldown"
   | "daily_budget"
-  | "lock_busy";
+  | "lock_busy"
+  | "cycle_full";
 
 export type GateResult =
   | { ok: true; lease?: AlwaysOnChannelLease }
@@ -152,10 +154,14 @@ export type AlwaysOnEventPhase =
   | "discovery_started"
   | "plan_produced"
   | "no_plan"
+  | "workspace_started"
   | "workspace_ready"
   | "execution_started"
   | "execution_completed"
+  | "report_started"
   | "report_produced"
+  | "apply_started"
+  | "apply_completed"
   | "run_completed"
   | "run_failed";
 

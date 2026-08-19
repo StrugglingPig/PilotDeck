@@ -11,6 +11,10 @@ const router = express.Router();
 // engine can boot. Treated as "not configured" so the UI routes to onboarding.
 const PLACEHOLDER_API_KEY = 'PLACEHOLDER_RUN_ONBOARDING_TO_REPLACE';
 
+function providerAllowsMissingApiKey(providerId) {
+  return providerId === 'ollama';
+}
+
 function hasUsablePilotDeckConfig() {
   const record = readPilotDeckConfigFile();
   if (!record.exists) return false;
@@ -30,15 +34,21 @@ function hasUsablePilotDeckConfig() {
 
   const hasUrl = typeof provider.url === 'string' && provider.url.trim();
   const apiKey = typeof provider.apiKey === 'string' ? provider.apiKey.trim() : '';
-  const hasRealKey = Boolean(apiKey) && apiKey !== PLACEHOLDER_API_KEY;
+  const hasRequiredCredential = providerAllowsMissingApiKey(providerId)
+    ? apiKey !== PLACEHOLDER_API_KEY
+    : Boolean(apiKey) && apiKey !== PLACEHOLDER_API_KEY;
   const hasModel = provider.models && typeof provider.models === 'object' && modelId in provider.models;
 
-  return Boolean(hasUrl && hasRealKey && hasModel);
+  return Boolean(hasUrl && hasRequiredCredential && hasModel);
 }
 
 function spawnAsync(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { ...options, shell: false });
+    const child = spawn(command, args, {
+      ...options,
+      shell: false,
+      windowsHide: process.platform === 'win32',
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (data) => { stdout += data.toString(); });

@@ -1,11 +1,14 @@
 import type { CanonicalMessage } from "../../model/index.js";
 import type { AgentTurnResult } from "../../agent/protocol/result.js";
+import type { FileArtifact } from "../artifacts/FileArtifact.js";
 
 export type AgentTranscriptEntryType =
   | "accepted_input"
   | "assistant_message"
   | "tool_result_message"
   | "durable_message"
+  | "agent_status_message"
+  | "file_artifacts"
   | "turn_result"
   | "control_boundary"
   | "session_metadata"
@@ -25,6 +28,7 @@ export type AgentTranscriptEntryBase = {
 export type AgentAcceptedInputTranscriptEntry = AgentTranscriptEntryBase & {
   type: "accepted_input";
   messages: CanonicalMessage[];
+  metadata?: Record<string, unknown>;
 };
 
 export type AgentMessageTranscriptEntry = AgentTranscriptEntryBase & {
@@ -32,17 +36,40 @@ export type AgentMessageTranscriptEntry = AgentTranscriptEntryBase & {
   message: CanonicalMessage;
 };
 
+export type AgentStatusMessageTranscriptEntry = AgentTranscriptEntryBase & {
+  type: "agent_status_message";
+  event: string;
+  kind: "status" | "error";
+  text: string;
+  detail?: Record<string, unknown>;
+};
+
 export type AgentTurnResultTranscriptEntry = AgentTranscriptEntryBase & {
   type: "turn_result";
   result: AgentTurnResult;
 };
 
+export type AgentFileArtifactsTranscriptEntry = AgentTranscriptEntryBase & {
+  type: "file_artifacts";
+  artifacts: FileArtifact[];
+};
+
 export type CompactBoundaryMetadata = {
+  /** Stable identity shared by live and persisted representations. */
+  compactionId?: string;
   trigger: "manual" | "auto" | "reactive";
   preTokens: number;
   postTokens?: number;
   /** Number of messages summarized into the boundary's summary section. */
   messagesSummarized?: number;
+  /** Desired post-compaction prompt size. */
+  targetTokens?: number;
+  /** Whether this compaction emitted a summary message. */
+  summaryGenerated?: boolean;
+  /** Whether prior checkpoint summaries were consolidated. */
+  checkpointMerged?: boolean;
+  /** Final prompt usage divided by the effective input budget. */
+  finalRatio?: number;
   /** Logical parent uuid before compact (for resume relink). */
   logicalParentUuid?: string;
   /** Optional verbatim segment that was preserved across the boundary. */
@@ -85,6 +112,8 @@ export type AgentControlBoundaryTranscriptEntry = AgentTranscriptEntryBase & {
 };
 
 export type SessionMetadataValue = {
+  /** Marks a metadata entry written by `reappendTail()` as a full snapshot. */
+  isSnapshot?: true;
   title?: string;
   aiTitle?: string;
   tag?: string;
@@ -92,11 +121,20 @@ export type SessionMetadataValue = {
   lastPrompt?: string;
   gitBranch?: string;
   mode?: "normal" | "coordinator";
+  /** Persisted dialog model preference. Null is an explicit clear tombstone. */
+  modelSelection?:
+    | { mode: "auto" }
+    | { mode: "model"; provider: string; model: string; reasoning?: number; temperature?: number }
+    | null;
   linkedPullRequest?: {
     number: number;
     url: string;
     repository: string;
   };
+  /** Parent session when this transcript was created via history fork. */
+  parentSessionId?: string;
+  /** Turn id of the fork point in the parent session. */
+  forkedFromTurnId?: string;
   updatedAt?: string;
 };
 
@@ -159,6 +197,8 @@ export type AgentSubagentCompletedTranscriptEntry = AgentTranscriptEntryBase & {
 export type AgentTranscriptEntry =
   | AgentAcceptedInputTranscriptEntry
   | AgentMessageTranscriptEntry
+  | AgentStatusMessageTranscriptEntry
+  | AgentFileArtifactsTranscriptEntry
   | AgentTurnResultTranscriptEntry
   | AgentControlBoundaryTranscriptEntry
   | AgentSessionMetadataTranscriptEntry

@@ -1,5 +1,6 @@
 import { isAbsolute, relative, resolve } from "node:path";
 import type { PilotDeckToolDefinition, PilotDeckToolRuntimeContext } from "../../tool/index.js";
+import { buildPlanModeViolationMessage, buildPlanModeBashViolationMessage } from "../../tool/planModeConstraints.js";
 import { matchPermissionRule } from "../policy/matchPermissionRule.js";
 import type {
   PermissionContext,
@@ -22,9 +23,10 @@ export class PermissionRuntime {
       permissionContext.rules.allow.filter((rule) => rule.source === "session"),
       tool.name,
       input,
+      permissionContext,
     );
 
-    const denyRule = findMatchingRule(permissionContext.rules.deny, tool.name, input);
+    const denyRule = findMatchingRule(permissionContext.rules.deny, tool.name, input, permissionContext);
     if (denyRule) {
       if (sessionAllowRule && denyRule.source === "user") {
         return this.allowSessionRule(tool, input, context, toolCallId, sessionAllowRule);
@@ -32,7 +34,7 @@ export class PermissionRuntime {
       return denyFromRule(denyRule);
     }
 
-    const askRule = findMatchingRule(permissionContext.rules.ask, tool.name, input);
+    const askRule = findMatchingRule(permissionContext.rules.ask, tool.name, input, permissionContext);
     if (askRule) {
       return finalizeAsk(askFromRule(tool, input, toolCallId, askRule), permissionContext);
     }
@@ -48,7 +50,7 @@ export class PermissionRuntime {
     // tool.checkPermissions returns ask → runtime surfaces another
     // permission prompt → next call repeats → infinite prompts.
     // Deny rules (checked above) still win over allow rules.
-    const allowRule = findMatchingRule(permissionContext.rules.allow, tool.name, input);
+    const allowRule = findMatchingRule(permissionContext.rules.allow, tool.name, input, permissionContext);
     if (allowRule) {
       // Plan mode deny takes precedence over user allow rules for
       // non-readonly tools (except plan-directory markdown writes). Without this guard,
@@ -101,7 +103,7 @@ export class PermissionRuntime {
           return deny({
             type: "mode",
             mode: "plan",
-            message: `Plan mode denies side-effecting tool ${tool.name}.`,
+            message: buildPlanModeDenyMessage(tool.name, input),
           });
         }
         return finalizeAsk(toolDecision, permissionContext);
@@ -200,15 +202,7 @@ function decideByMode(
     return deny({
       type: "mode",
       mode: "plan",
-      message: `Plan mode denies side-effecting tool ${tool.name}.`,
-    });
-  }
-
-  if (context.mode === "acceptEdits" && tool.kind === "filesystem" && !tool.isReadOnly(input)) {
-    return allow({
-      type: "mode",
-      mode: "acceptEdits",
-      message: `acceptEdits allows filesystem edit tool ${tool.name}.`,
+      message: buildPlanModeDenyMessage(tool.name, input),
     });
   }
 
@@ -227,8 +221,13 @@ function decideByMode(
   });
 }
 
-function findMatchingRule(rules: PermissionRule[], toolName: string, input: unknown): PermissionRule | undefined {
-  return rules.find((rule) => matchPermissionRule(rule, toolName, input));
+function findMatchingRule(
+  rules: PermissionRule[],
+  toolName: string,
+  input: unknown,
+  context: PermissionContext,
+): PermissionRule | undefined {
+  return rules.find((rule) => matchPermissionRule(rule, toolName, input, context));
 }
 
 function allow(reason: PermissionDecisionReason): PermissionDecision {
@@ -310,15 +309,14 @@ function finalizeAsk(decision: PermissionDecision, context: PermissionContext): 
     };
   }
 
-  if (context.mode === "dontAsk") {
+  if (context.canPrompt === false) {
     return {
       type: "deny",
       reason: {
-        type: "mode",
-        mode: "dontAsk",
-        message: "dontAsk mode denies permission prompts.",
+        type: "runtime",
+        message: "Permission prompt denied because prompts are disabled for this session.",
       },
-      message: "Permission prompt denied because dontAsk mode is active.",
+      message: "Permission prompt denied because prompts are disabled for this session.",
     };
   }
 
@@ -363,4 +361,17 @@ function isPlanDirectoryWrite(
     && !relativeToPlanDir.startsWith("..")
     && !relativeToPlanDir.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)
   );
+}
+
+/**
+ * Build a structured plan-mode deny message with corrective guidance.
+ * For `bash`, extracts the command string to give a more precise hint.
+ */
+function buildPlanModeDenyMessage(toolName: string, input: unknown): string {
+  if (toolName === "bash") {
+    const record = input as Record<string, unknown> | null;
+    const command = typeof record?.command === "string" ? record.command : "";
+    return buildPlanModeBashViolationMessage(command);
+  }
+  return buildPlanModeViolationMessage(toolName);
 }

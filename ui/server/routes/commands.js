@@ -11,6 +11,9 @@ import { getClaudeRuntimeModelConfig, getClaudeRuntimeModelValues } from '../uti
 import { readPilotDeckConfigFile, resolveModel } from '../services/pilotdeckConfig.js';
 import { resolvePilotHome } from '../utils/pilotPaths.js';
 import { executeTurnkeySlashCommand } from '../turnkey-slash.js';
+import { getRegisteredCommands } from '../../../src/adapters/channel/protocol/ChannelCommandRegistry.js';
+import { runChatSearchFormatted } from '../../../src/cli/commands/chatSearch.js';
+import { getPilotDeckGateway } from '../pilotdeck-bridge.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -182,15 +185,13 @@ async function scanSkillsDirectory(dir, namespace) {
 }
 
 /**
- * Built-in commands that are always available
+ * Built-in commands that are always available.
+ *
+ * Web-UI-only commands (that don't make sense in IM channels) are defined here.
+ * Commands shared with IM channels (/update, /projects, /switch-project, /status,
+ * /help) are auto-merged from ChannelCommandRegistry — single source of truth.
  */
-const builtInCommands = [
-  {
-    name: '/help',
-    description: 'Show help documentation for PilotDeck',
-    namespace: 'builtin',
-    metadata: { type: 'builtin' }
-  },
+const webOnlyBuiltInCommands = [
   {
     name: '/clear',
     description: 'Clear the conversation history',
@@ -222,12 +223,6 @@ const builtInCommands = [
     metadata: { type: 'builtin' }
   },
   {
-    name: '/status',
-    description: 'Show system status and version information',
-    namespace: 'builtin',
-    metadata: { type: 'builtin' }
-  },
-  {
     name: '/rewind',
     description: 'Rewind the conversation to a previous state',
     namespace: 'builtin',
@@ -246,12 +241,6 @@ const builtInCommands = [
     metadata: { type: 'builtin' }
   },
   {
-    name: '/switch-project',
-    description: 'Switch to another project by name (for example: /switch-project xhs-voxcpm)',
-    namespace: 'builtin',
-    metadata: { type: 'builtin' }
-  },
-  {
     name: '/skill_install',
     description:
       'Install a skill from clawhub.com. Auto-targets ~/.pilotdeck/skills/<slug> in general chat and <project>/.pilotdeck/skills/<slug> when a project is active. Use --global / --project to override.',
@@ -263,10 +252,63 @@ const builtInCommands = [
   },
 ];
 
+// Merge commands from the centralized ChannelCommandRegistry.
+// This ensures /update, /projects, /switch-project, etc. appear in the
+// Web UI menu automatically when added to the registry.
+const registryCommands = getRegisteredCommands()
+  .filter((cmd) => cmd.name !== 'new') // /new is implicit (new session button)
+  .map((cmd) => ({
+    name: '/' + cmd.name,
+    description: cmd.description,
+    namespace: 'builtin',
+    metadata: { type: 'builtin', source: 'registry' },
+  }));
+
+const builtInCommands = [
+  ...webOnlyBuiltInCommands,
+  ...registryCommands.filter(
+    (rc) => !webOnlyBuiltInCommands.some((w) => w.name === rc.name),
+  ),
+];
+
 /**
  * Built-in command handlers
  * Each handler returns { type: 'builtin', action: string, data: any }
  */
+async function executeSearchCommand(args, context) {
+  const rawArg = (args || []).join(' ').trim();
+  if (!rawArg) {
+    return {
+      type: 'builtin',
+      action: 'search',
+      data: {
+        error: true,
+        content: 'Usage: /search <keyword> [--all] [--limit N] [--role user|assistant]\nExample: /search docker deploy',
+      },
+    };
+  }
+
+  const { result, text } = await runChatSearchFormatted({
+    arg: rawArg,
+    projectRoot: context?.projectPath,
+    pilotHome: resolvePilotHome(process.env),
+    locale: 'en',
+  });
+
+  return {
+    type: 'builtin',
+    action: 'search',
+    data: {
+      content: text,
+      format: 'markdown',
+      query: result.query,
+      matches: result.matches,
+      truncated: result.truncated,
+      sessionsScanned: result.sessionsScanned,
+    },
+  };
+}
+
 const builtInHandlers = {
   '/help': async (args, context) => {
     const helpText = `# PilotDeck Commands
@@ -538,6 +580,59 @@ Custom commands can be created in:
 
   '/turnkey': async (args) => executeTurnkeySlashCommand(args),
 
+  '/search': executeSearchCommand,
+  '/find': executeSearchCommand,
+  '/grep': executeSearchCommand,
+
+  '/update': async (args, context) => {
+    const subcommand = (args && args[0]) || 'apply';
+
+    if (subcommand === 'check') {
+      try {
+        const result = await execFileAsync('bash', [
+          '-c',
+          'cd "$(git rev-parse --show-toplevel)" && git fetch origin "$(git branch --show-current)" 2>/dev/null && ' +
+          'LOCAL=$(git rev-parse HEAD) && REMOTE=$(git rev-parse "origin/$(git branch --show-current)") && ' +
+          'if [ "$LOCAL" = "$REMOTE" ]; then echo "up-to-date"; else echo "update-available"; fi'
+        ], { timeout: 30000 });
+        const hasUpdate = result.stdout.trim() === 'update-available';
+        return {
+          type: 'builtin',
+          action: 'update',
+          data: {
+            subcommand: 'check',
+            hasUpdate,
+            message: hasUpdate
+              ? 'New version available! Run `/update` to apply.'
+              : 'Already up-to-date.',
+          },
+        };
+      } catch (e) {
+        return {
+          type: 'builtin',
+          action: 'update',
+          data: {
+            subcommand: 'check',
+            error: true,
+            message: `Failed to check for updates: ${e.message}`,
+          },
+        };
+      }
+    }
+
+    // Default: trigger the update via the API endpoint.
+    // The frontend will call /api/update/apply and stream progress.
+    return {
+      type: 'builtin',
+      action: 'update',
+      data: {
+        subcommand: 'apply',
+        message: 'Starting update... pulling latest code, rebuilding, and restarting.',
+        triggerApi: '/api/update/apply',
+      },
+    };
+  },
+
   '/switch-project': async (args) => {
     // Trim quotes / whitespace; the rest of the project resolution (matching
     // against the user's project list, navigating, expanding the sidebar
@@ -665,7 +760,7 @@ Custom commands can be created in:
       workdir = effectiveProjectPath;
       dir = path.join('.pilotdeck', 'skills');
     } else {
-      workdir = path.join(os.homedir(), '.pilotdeck');
+      workdir = resolvePilotHome(process.env);
       dir = 'skills';
     }
     const installPath = path.join(workdir, dir, slug);
@@ -790,81 +885,60 @@ Custom commands can be created in:
  */
 router.post('/list', async (req, res) => {
   try {
-    const { projectPath } = req.body;
-    const homeDir = os.homedir();
-
-    const customCommandSources = [];
-
-    if (projectPath) {
-      const projectCommandsDir = path.join(projectPath, '.pilotdeck', 'commands');
-      const projectSkillsDir = path.join(projectPath, '.pilotdeck', 'skills');
-      const [projectCommands, projectSkills] = await Promise.all([
-        scanCommandsDirectory(projectCommandsDir, projectCommandsDir, 'project'),
-        scanSkillsDirectory(projectSkillsDir, 'project'),
-      ]);
-      customCommandSources.push(...projectCommands, ...projectSkills);
+    const { projectKey, projectPath, query, cursor, limit } = req.body || {};
+    const gateway = await getPilotDeckGateway();
+    const serverInfo = await gateway.describeServer();
+    if (!serverInfo.capabilities?.includes('commands_list')) {
+      const legacy = await listLegacyCommands(projectKey || projectPath);
+      return res.json({ ...legacy, count: legacy.builtIn.length + legacy.custom.length });
     }
-
-    const userCommandsDir = path.join(homeDir, '.pilotdeck', 'commands');
-    const userSkillsDir = path.join(homeDir, '.pilotdeck', 'skills');
-    const [userCommands, userSkills] = await Promise.all([
-      scanCommandsDirectory(userCommandsDir, userCommandsDir, 'user'),
-      scanSkillsDirectory(userSkillsDir, 'user'),
-    ]);
-    customCommandSources.push(...userCommands, ...userSkills);
-
-    // Track every name we've committed so far to a single namespace. Built-in
-    // names take precedence over disk customs and bundled stubs (their server-
-    // side handlers in `builtInHandlers` are authoritative).
-    const seenNames = new Set(builtInCommands.map((cmd) => cmd.name));
-
-    const dedupedCustom = [];
-    for (const cmd of customCommandSources) {
-      if (seenNames.has(cmd.name)) continue;
-      seenNames.add(cmd.name);
-      dedupedCustom.push(cmd);
-    }
-
-    const builtInsWithBundled = [...builtInCommands];
-    for (const stub of BUNDLED_SKILL_STUBS) {
-      if (seenNames.has(stub.name)) continue;
-      builtInsWithBundled.push({
-        ...stub,
-        namespace: 'builtin',
-      });
-      seenNames.add(stub.name);
-    }
-
-    dedupedCustom.sort((a, b) => a.name.localeCompare(b.name));
-
-    const pinnedSet = new Set(PINNED_COMMAND_NAMES);
-    const promote = (cmd) =>
-      pinnedSet.has(cmd.name) ? { ...cmd, namespace: 'pinned' } : cmd;
-    const builtIn = builtInsWithBundled.map(promote);
-    const custom = dedupedCustom.map(promote);
-
-    const indexByName = new Map();
-    for (const cmd of [...builtIn, ...custom]) {
-      if (!indexByName.has(cmd.name)) indexByName.set(cmd.name, cmd);
-    }
-    const pinnedOrdered = PINNED_COMMAND_NAMES
-      .map((name) => indexByName.get(name))
-      .filter(Boolean);
-
+    const data = await gateway.commandsList({
+      projectKey: projectKey || projectPath,
+      query,
+      cursor,
+      limit,
+    });
     res.json({
-      builtIn,
-      custom,
-      pinned: pinnedOrdered,
-      count: builtIn.length + custom.length,
+      ...data,
+      count: data.builtIn.length + data.custom.length,
     });
   } catch (error) {
     console.error('Error listing commands:', error);
-    res.status(500).json({
-      error: 'Failed to list commands',
-      message: error.message,
-    });
+    const code = error?.code || 'gateway_request_failed';
+    const status = ['PROJECT_NOT_FOUND'].includes(code) ? 404
+      : ['INVALID_QUERY', 'INVALID_CURSOR', 'INVALID_LIMIT'].includes(code) ? 400
+        : code === 'CAPABILITY_UNAVAILABLE' ? 501 : 500;
+    res.status(status).json({ error: { code, message: error.message || String(error), ...(req.id ? { requestId: req.id } : {}) } });
   }
 });
+
+async function listLegacyCommands(projectPath) {
+  const pilotHome = resolvePilotHome(process.env);
+  const sources = [];
+  if (projectPath) {
+    const commandsDir = path.join(projectPath, '.pilotdeck', 'commands');
+    const skillsDir = path.join(projectPath, '.pilotdeck', 'skills');
+    const [commands, skills] = await Promise.all([
+      scanCommandsDirectory(commandsDir, commandsDir, 'project'),
+      scanSkillsDirectory(skillsDir, 'project'),
+    ]);
+    sources.push(...commands, ...skills);
+  }
+  const userCommandsDir = path.join(pilotHome, 'commands');
+  const [userCommands, userSkills] = await Promise.all([
+    scanCommandsDirectory(userCommandsDir, userCommandsDir, 'user'),
+    scanSkillsDirectory(path.join(pilotHome, 'skills'), 'user'),
+  ]);
+  sources.push(...userCommands, ...userSkills);
+  const seen = new Set(builtInCommands.map((item) => item.name));
+  const custom = sources.filter((item) => !seen.has(item.name) && Boolean(seen.add(item.name))).sort((a, b) => a.name.localeCompare(b.name));
+  const builtIn = [...builtInCommands];
+  for (const stub of BUNDLED_SKILL_STUBS) {
+    if (!seen.has(stub.name)) { builtIn.push({ ...stub, namespace: 'builtin' }); seen.add(stub.name); }
+  }
+  const index = new Map([...builtIn, ...custom].map((item) => [item.name, item]));
+  return { builtIn, custom, pinned: PINNED_COMMAND_NAMES.map((name) => index.get(name)).filter(Boolean) };
+}
 
 /**
  * POST /api/commands/load
@@ -924,7 +998,7 @@ router.post('/load', async (req, res) => {
  */
 router.post('/execute', async (req, res) => {
   try {
-    const { commandName, commandPath, args = [], context = {} } = req.body;
+    const { commandName, commandPath, args = [], rawArgs, rawInput, context = {} } = req.body;
 
     if (!commandName) {
       return res.status(400).json({
@@ -959,11 +1033,18 @@ router.post('/execute', async (req, res) => {
     const isBundledStub = BUNDLED_SKILL_STUBS.some(
       (stub) => stub.name === commandName,
     );
+    const buildPassthroughContent = () => {
+      if (typeof rawInput === 'string' && rawInput.trimStart().startsWith(commandName)) {
+        return rawInput.trim();
+      }
+      const argsString = typeof rawArgs === 'string'
+        ? rawArgs.trimStart()
+        : args.join(' ').trim();
+      return argsString ? `${commandName} ${argsString}` : commandName;
+    };
+
     if (isBundledStub) {
-      const argsString = args.join(' ').trim();
-      const passthroughContent = argsString
-        ? `${commandName} ${argsString}`
-        : commandName;
+      const passthroughContent = buildPassthroughContent();
       return res.json({
         type: 'custom',
         command: commandName,
@@ -978,10 +1059,7 @@ router.post('/execute', async (req, res) => {
     // SKILL.md body into chat. Instead, passthrough the slash text so the
     // proxy's slash parser invokes SkillTool with the procedural body.
     if (commandPath && /\/\.pilotdeck\/skills\/[^/]+\/SKILL\.md$/i.test(commandPath)) {
-      const argsString = args.join(' ').trim();
-      const passthroughContent = argsString
-        ? `${commandName} ${argsString}`
-        : commandName;
+      const passthroughContent = buildPassthroughContent();
       return res.json({
         type: 'custom',
         command: commandName,
@@ -1002,9 +1080,10 @@ router.post('/execute', async (req, res) => {
     // Security: validate commandPath is within allowed directories.
     {
       const resolvedPath = path.resolve(commandPath);
+      const pilotHome = resolvePilotHome(process.env);
       const allowedBases = [
-        path.resolve(path.join(os.homedir(), '.pilotdeck', 'commands')),
-        path.resolve(path.join(os.homedir(), '.pilotdeck', 'skills')),
+        path.resolve(path.join(pilotHome, 'commands')),
+        path.resolve(path.join(pilotHome, 'skills')),
       ];
       if (context?.projectPath) {
         allowedBases.push(

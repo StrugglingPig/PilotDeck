@@ -78,7 +78,11 @@ export {
   type ExecutionRunContext,
   type ReportRunContext,
 } from "./runtime/AlwaysOnRunContextRegistry.js";
-export { SessionConfigOverrides, type SessionConfigOverride } from "./runtime/SessionConfigOverrides.js";
+export {
+  SessionConfigOverrides,
+  UNATTENDED_SESSION_EXCLUDED_TOOLS,
+  type SessionConfigOverride,
+} from "./runtime/SessionConfigOverrides.js";
 export {
   DiscoveryFire,
   acquireDiscoveryLock,
@@ -157,7 +161,7 @@ export {
   type WebPlanContextRefs,
   type WebPlanStatus,
 } from "./web/DiscoveryPlanStatus.js";
-export { DiscoveryPlanService, normalizeDiscoveryPlanRecord, type DiscoveryPlanServiceDeps } from "./web/DiscoveryPlanService.js";
+export { DiscoveryPlanService, normalizeDiscoveryPlanRecord, type DiscoveryPlanServiceDeps, type StateManager } from "./web/DiscoveryPlanService.js";
 export { buildDiscoveryContext, type DiscoveryContextDeps } from "./web/DiscoveryPlanContext.js";
 export { AlwaysOnRunHistoryService, type AlwaysOnRunHistoryServiceDeps, type RunHistoryEntry, type RunHistoryDetailEntry } from "./web/AlwaysOnRunHistoryService.js";
 export { GitWorktreeProvider, type GitWorktreeProviderOptions } from "./workspace/GitWorktreeProvider.js";

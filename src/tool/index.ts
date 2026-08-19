@@ -30,6 +30,8 @@ export type {
 } from "./protocol/schema.js";
 export type {
   PilotDeckToolCall,
+  PilotDeckToolAvailability,
+  PilotDeckToolAvailabilityContext,
   PilotDeckToolDefinition,
   PilotDeckToolExecutionOutput,
   PilotDeckToolSupplementalMessage,
@@ -53,6 +55,11 @@ export type {
 } from "./protocol/types.js";
 export { ToolRegistry } from "./registry/ToolRegistry.js";
 export { createBuiltinRegistry, type CreateBuiltinRegistryOptions } from "./registry/createBuiltinRegistry.js";
+export {
+  filterAvailableTools,
+  type FilterAvailableToolsResult,
+  type PilotDeckUnavailableToolDiagnostic,
+} from "./registry/filterAvailableTools.js";
 export { ConcurrentToolScheduler } from "./scheduler/ConcurrentToolScheduler.js";
 export { SequentialToolScheduler } from "./scheduler/SequentialToolScheduler.js";
 export type { PilotDeckToolScheduler } from "./scheduler/ToolScheduler.js";
@@ -67,8 +74,20 @@ export {
 } from "./builtin/agent.js";
 export { createReadFileTool, type ReadFileInput } from "./builtin/readFile.js";
 export { createReadSkillTool, type ReadSkillDeps, type ReadSkillInput } from "./builtin/readSkill.js";
-export { createGlobTool, type GlobInput } from "./builtin/glob.js";
+export { createGlobTool, extractGlobBaseDirectory, type GlobInput } from "./builtin/glob.js";
 export { createGrepTool, type GrepInput } from "./builtin/grep.js";
+export {
+  createExecuteCodeTool,
+  type CreateExecuteCodeToolOptions,
+  type ExecuteCodeOutput,
+  type ExecuteCodeStatus,
+  type ExecuteCodeToolCallLogEntry,
+} from "./builtin/executeCode.js";
+export {
+  createGetCurrentTimeTool,
+  type GetCurrentTimeInput,
+  type GetCurrentTimeOutput,
+} from "./builtin/getCurrentTime.js";
 export { createEditFileTool, type EditFileInput } from "./builtin/editFile.js";
 export {
   createEditNotebookTool,
@@ -78,6 +97,9 @@ export {
 export { createWriteFileTool, type WriteFileInput, type WriteFileOutput } from "./builtin/writeFile.js";
 export {
   createBashTool,
+  type BashOutput,
+  type BashOutputAssertions,
+  type BashOutputState,
   type BashInput,
   type CreateBashToolOptions,
   type PilotDeckCommandOptions,
@@ -106,6 +128,7 @@ export {
   createWebFetchTool,
   type CreateWebFetchToolOptions,
   type WebFetchInput,
+  type WebFetchMode,
   type WebFetchOutput,
 } from "./builtin/webFetch.js";
 export {
@@ -127,9 +150,11 @@ export {
   MAX_MARKDOWN_LENGTH,
   MAX_REDIRECTS,
   truncateMarkdown,
+  WebFetchHttpError,
   WEB_FETCH_USER_AGENT,
   type FetchHook,
   type RedirectInfo,
+  type WebFetchHttpErrorOptions,
   type WebFetchHttpResult,
 } from "./builtin/web/urlFetcher.js";
 export {
@@ -177,6 +202,7 @@ export {
   createTaskListTool,
   createTaskOutputTool,
   createTaskStopTool,
+  createTaskWaitTool,
   createTaskTools,
   type CreateTaskToolsOptions,
   type TaskCreateInput,
@@ -187,6 +213,8 @@ export {
   type TaskOutputResult,
   type TaskStopInput,
   type TaskStopResult,
+  type TaskWaitInput,
+  type TaskWaitResult,
 } from "./builtin/taskTools.js";
 export {
   createTodoWriteTool,
@@ -194,3 +222,18 @@ export {
   type TodoWriteInput,
   type TodoWriteOutput,
 } from "./builtin/todoWrite.js";
+export {
+  PLAN_MODE_ALLOWED_TOOLS,
+  buildPlanModeViolationMessage,
+  buildPlanModeBashViolationMessage,
+  isPlanModeViolationText,
+} from "./planModeConstraints.js";
+export {
+  ASK_MODE_ALLOWED_TOOLS,
+  ASK_MODE_DESCRIPTION_SUFFIX,
+  buildAskModeViolationMessage,
+  buildAskModeBashViolationMessage,
+  getAskModeViolation,
+  isAskModeAllowedTool,
+  isAskModeViolationText,
+} from "./askModeConstraints.js";

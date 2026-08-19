@@ -101,6 +101,8 @@ function toLegacySession(session, projectName) {
         aiTitle: session.aiTitle,
         firstPrompt: session.firstPrompt,
         tag: presentation.tag,
+        parentSessionId: session.parentSessionId,
+        forkedFromTurnId: session.forkedFromTurnId,
         __projectName: projectName,
     };
 }
@@ -221,7 +223,6 @@ async function getProjects(progressCallback = null) {
                 hasMore: (project.sessionCount ?? sessions.length) > sessions.length,
             },
             taskmaster,
-            alwaysOn: { enabled: false },
         });
     }
 
@@ -281,7 +282,6 @@ async function getProjects(progressCallback = null) {
             hasMore: generalTotal > generalSessions.length,
         },
         taskmaster: { hasTaskmaster: false },
-        alwaysOn: { enabled: false },
     });
 
     return result;
@@ -486,10 +486,17 @@ async function resolveProjectIdForPathOrName(projectName, fullPath) {
     return createProjectId(fullPath);
 }
 
-async function getProjectCronJobsOverview(_projectName) {
+async function getProjectCronJobsOverview(projectName) {
     try {
         const gateway = await getPilotDeckGateway();
-        const result = await gateway.cronList({ includeHistory: true, limit: 50 });
+        const projectKey = projectName
+            ? await extractProjectDirectory(projectName)
+            : undefined;
+        const result = await gateway.cronList({
+            projectKey,
+            includeHistory: true,
+            limit: 50,
+        });
         const runsByTaskId = new Map();
         if (Array.isArray(result.recentRuns)) {
             for (const run of result.recentRuns) {
@@ -507,8 +514,12 @@ async function getProjectCronJobsOverview(_projectName) {
                 id: task.taskId,
                 projectKey: task.projectKey || null,
                 cron: isCron ? task.schedule.expression : '',
+                schedule: task.schedule,
+                timezone: task.timezone || task.schedule?.timezone || null,
+                revision: Number.isSafeInteger(task.revision) && task.revision >= 0 ? task.revision : 0,
                 prompt: task.message || '',
                 createdAt: task.createdAt,
+                nextRunAt: task.nextRunAt,
                 recurring: isCron,
                 permanent: isCron,
                 manualOnly: false,
